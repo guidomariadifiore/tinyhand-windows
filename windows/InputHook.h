@@ -32,12 +32,12 @@ public:
     std::function<void()> onToggleShortcut;
     std::function<void()> onClearShortcut;
     
+    static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
+
 private:
     InputHook();
     ~InputHook();
-    
-    static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam);
-    static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
     
     LRESULT HandleMouse(int nCode, WPARAM wParam, LPARAM lParam);
     LRESULT HandleKeyboard(int nCode, WPARAM wParam, LPARAM lParam);
@@ -52,6 +52,7 @@ private:
     UINT m_interactVk = VK_MENU; // Default Alt
     
     std::vector<RECT> m_passThroughRects;
+    mutable std::mutex m_passThroughMutex;
     
     mutable std::mutex m_sysUIMutex;
     mutable POINT m_cachedSysUIPt = { -99999, -99999 };

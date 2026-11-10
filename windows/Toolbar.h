@@ -3,6 +3,8 @@
 #include "Common.h"
 #include <functional>
 #include <mutex>
+#include <atomic>
+#include <vector>
 
 namespace TinyHand {
 
@@ -34,10 +36,15 @@ public:
                 double screenW, double screenH, bool isDrawing, ULONGLONG now);
                 
     void Show(bool show);
-    bool IsRevealed() const { return m_alpha > 0.05f; }
+    bool IsRevealed() const { return m_alpha.load(std::memory_order_relaxed) > 0.05f || m_targetAlpha > 0.5f; }
     RECT GetTotalRect() const;
     std::vector<RECT> GetInteractiveRects() const;
     bool IsOverInteractive(double screenX, double screenY) const;
+    
+    void NotifyCursorPos(double cursorX, double cursorY);
+    void SetDrawing(bool isDrawing);
+    void SetScreenGeometry(double screenX, double screenY, double screenW, double screenH);
+    HWND GetHwnd() const { return m_hwnd; }
     
     // Callbacks
     std::function<void(PointerStyleId)> onSelectStyle;
@@ -60,6 +67,10 @@ private:
     void RenderContent();
     void RecalculateLayout();
     ToolbarItem* HitTest(int x, int y);
+    void StartFadeTimer();
+    void StopFadeTimer();
+    void OnTimerTick();
+    void UpdatePassThroughRects();
     
     HWND m_hwnd = NULL;
     HINSTANCE m_hInstance = NULL;
@@ -76,9 +87,12 @@ private:
     InkChoiceId m_inkChoice = InkChoiceId::Match;
     bool m_inkOpen = false;
     
-    float m_alpha = 0.0f;
+    std::atomic<float> m_alpha{ 0.0f };
     float m_targetAlpha = 0.0f;
-    ULONGLONG m_revealUntil = 0;
+    std::atomic<ULONGLONG> m_revealUntil{ 0 };
+    std::atomic<bool> m_isDrawing{ false };
+    bool m_timerActive = false;
+    bool m_trackingMouse = false;
     
     double m_screenX = 0;
     double m_screenY = 0;
@@ -86,7 +100,7 @@ private:
     double m_screenH = 1080;
     
     int m_windowW = 400;
-    int m_windowH = 120;
+    int m_windowH = 130;
     int m_windowX = 0;
     int m_windowY = 0;
     

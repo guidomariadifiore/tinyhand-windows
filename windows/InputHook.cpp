@@ -44,6 +44,7 @@ void InputHook::SetActive(bool active) {
 }
 
 void InputHook::SetPassThroughRects(const std::vector<RECT>& rects) {
+    std::lock_guard<std::mutex> lock(m_passThroughMutex);
     m_passThroughRects = rects;
 }
 
@@ -146,9 +147,12 @@ LRESULT InputHook::HandleMouse(int nCode, WPARAM wParam, LPARAM lParam) {
     }
     
     // Check if in pass-through rect (e.g. Toolbar interactive buttons)
-    for (const auto& r : m_passThroughRects) {
-        if (PtInRect(&r, ms->pt)) {
-            return CallNextHookEx(m_hMouseHook, nCode, wParam, lParam);
+    {
+        std::lock_guard<std::mutex> lock(m_passThroughMutex);
+        for (const auto& r : m_passThroughRects) {
+            if (PtInRect(&r, ms->pt)) {
+                return CallNextHookEx(m_hMouseHook, nCode, wParam, lParam);
+            }
         }
     }
     

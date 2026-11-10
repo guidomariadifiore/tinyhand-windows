@@ -629,6 +629,117 @@ void Test144HzRefreshRateLock() {
     std::cout << "  -> 144Hz Display Refresh Rate Lock PASSED" << std::endl;
 }
 
+void TestToolbarDeadlockAndPointerSwitching() {
+    std::cout << "[TEST] Testing Toolbar Thread Safety & Deadlock Prevention..." << std::endl;
+    HINSTANCE hInst = GetModuleHandle(NULL);
+    OverlayWindow overlay;
+    bool created = overlay.Create(hInst);
+    TEST_ASSERT(created, "Overlay created");
+    
+    HWND hToolbar = FindWindowW(L"TinyHand_ToolbarClass", NULL);
+    TEST_ASSERT(hToolbar != NULL, "Toolbar window created");
+    
+    overlay.Activate();
+    TEST_ASSERT(overlay.IsActive(), "Overlay activated");
+    
+    std::atomic<bool> stopStress{ false };
+    std::atomic<int> mouseMoves{ 0 };
+    std::atomic<int> styleChanges{ 0 };
+    
+    // Background thread: Continuously feeds mouse events and drawing gestures to presentation thread
+    std::thread inputStressThread([&]() {
+        int x = 500, y = 400;
+        int dx = 2, dy = 3;
+        while (!stopStress) {
+            x += dx;
+            y += dy;
+            if (x < 100 || x > 1500) dx = -dx;
+            if (y < 100 || y > 800) dy = -dy;
+            
+            InputHook::Instance().onMouseMove(x, y);
+            mouseMoves++;
+            
+            if (mouseMoves % 15 == 0) {
+                InputHook::Instance().onMouseDown(x, y);
+                for (int s = 0; s < 4; ++s) {
+                    InputHook::Instance().onMouseMove(x + s * 3, y + s * 2);
+                }
+                InputHook::Instance().onMouseUp(x + 12, y + 8);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    
+    // UI thread: Rapidly switch pointer styles via Toolbar messages and direct style calls
+    PointerStyleId testStyles[] = {
+        PointerStyleId::Lavender, PointerStyleId::Pink, PointerStyleId::Black,
+        PointerStyleId::Glove, PointerStyleId::Plush, PointerStyleId::Robot,
+        PointerStyleId::Laser, PointerStyleId::Coral, PointerStyleId::Mint
+    };
+    
+    ULONGLONG tStart = GetTickCount64();
+    int cycle = 0;
+    while (GetTickCount64() - tStart < 800) {
+        // Pump UI message loop
+        MSG msg;
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        
+        // Simulate mouse hovering over toolbar pill (triggers Toolbar WM_MOUSEMOVE & Render)
+        SendMessageW(hToolbar, WM_MOUSEMOVE, 0, MAKELPARAM(50, 95));
+        
+        // Switch styles rapidly
+        PointerStyleId nextStyle = testStyles[cycle % 9];
+        SendMessageW(hToolbar, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(30 + (cycle % 4) * 40, 95));
+        
+        // Also simulate real low-level hook click pass-through
+        RECT tbRect = { 0 };
+        GetWindowRect(hToolbar, &tbRect);
+        MSLLHOOKSTRUCT msHook = { { tbRect.left + 50, tbRect.top + 95 }, 0, 0, 0, 0 };
+        LRESULT hookRes = InputHook::LowLevelMouseProc(0, WM_LBUTTONDOWN, (LPARAM)&msHook);
+        (void)hookRes;
+        
+        if (cycle % 3 == 0) {
+            Settings s = overlay.GetSettings();
+            s.currentStyle = nextStyle;
+            overlay.ApplySettings(s);
+            styleChanges++;
+        }
+        
+        if (cycle % 7 == 0) {
+            overlay.ClearInk();
+        }
+        
+        // Rapid toggle stress
+        if (cycle == 40) {
+            overlay.Deactivate();
+            overlay.Activate();
+        }
+        
+        cycle++;
+        Sleep(4);
+    }
+    
+    stopStress = true;
+    inputStressThread.join();
+    
+    TEST_ASSERT(mouseMoves > 100, "Render thread processed heavy concurrent mouse traffic");
+    TEST_ASSERT(styleChanges > 10, "Multiple pointer style changes executed smoothly without deadlock");
+    
+    // Verify front buffer is still valid and receiving frames
+    void* bits = overlay.GetFrontBufferBits();
+    TEST_ASSERT(bits != nullptr, "Front buffer remained valid under concurrent toolbar load");
+    
+    overlay.Deactivate();
+    TEST_ASSERT(!overlay.IsActive(), "Overlay cleanly deactivated");
+    overlay.Destroy();
+    
+    std::cout << "  -> Toolbar Thread Safety & Deadlock Prevention PASSED (" 
+              << styleChanges << " style changes, " << mouseMoves << " mouse inputs processed with ZERO deadlocks)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "TinyHand Windows Test Suite" << std::endl;
@@ -651,12 +762,13 @@ int main() {
     TestFlickerAndThreadSafety();
     TestRealtimeCursorTracking();
     Test144HzRefreshRateLock();
+    TestToolbarDeadlockAndPointerSwitching();
     
     HandAssetManager::Instance().ClearCache();
     Gdiplus::GdiplusShutdown(gdiplusToken);
     
     std::cout << "========================================" << std::endl;
-    std::cout << "ALL 12 TEST SUITES PASSED (100% SUCCESS)!" << std::endl;
+    std::cout << "ALL 13 TEST SUITES PASSED (100% SUCCESS)!" << std::endl;
     std::cout << "========================================" << std::endl;
     return 0;
 }

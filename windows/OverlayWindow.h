@@ -44,6 +44,8 @@ public:
     LRESULT HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 private:
+    bool RenderFrame(int& outBackIdx);
+    void PresentFrame(int backIdx);
     void TickAndRender();
     void StartRenderThread();
     void StopRenderThread();
@@ -88,7 +90,7 @@ private:
     int m_screenH = 1080;
     std::atomic<int> m_displayRefreshRate{ 144 };
     
-    bool m_geometryDirty = true;
+    std::atomic<bool> m_geometryDirty{ true };
     
     std::atomic<ULONGLONG> m_lastMoveTime{ 0 };
     ULONGLONG m_stillSince = 0;
