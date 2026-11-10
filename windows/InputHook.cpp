@@ -64,7 +64,9 @@ LRESULT CALLBACK InputHook::LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARA
 bool InputHook::IsOverInteractiveSystemUI(POINT pt) const {
     std::lock_guard<std::mutex> lock(m_sysUIMutex);
     ULONGLONG now = GetTickCount64();
-    if (std::abs(pt.x - m_cachedSysUIPt.x) < 8 && std::abs(pt.y - m_cachedSysUIPt.y) < 8 && (now - m_cachedSysUITime) < 40) {
+    if ((now - m_cachedSysUITime) < 35 && 
+        (m_cachedSysUIResult ? (std::abs(pt.x - m_cachedSysUIPt.x) < 12 && std::abs(pt.y - m_cachedSysUIPt.y) < 12)
+                             : (std::abs(pt.x - m_cachedSysUIPt.x) < 24 && std::abs(pt.y - m_cachedSysUIPt.y) < 24))) {
         return m_cachedSysUIResult;
     }
     

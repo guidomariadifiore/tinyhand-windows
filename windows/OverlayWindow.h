@@ -32,6 +32,7 @@ public:
     int GetScreenHeight() const { return m_screenH; }
     double GetCursorX() const { return m_cursorX.load(); }
     double GetCursorY() const { return m_cursorY.load(); }
+    int GetRefreshRate() const { return m_displayRefreshRate.load(); }
     
     void ApplySettings(const Settings& s);
     const Settings& GetSettings() const { return m_settings; }
@@ -47,6 +48,7 @@ private:
     void StartRenderThread();
     void StopRenderThread();
     void RenderThreadProc();
+    int DetectRefreshRate();
     void ExtendInkIfDrawing(double x, double y);
     
     void HandleMouseDown(int x, int y);
@@ -84,6 +86,7 @@ private:
     int m_screenY = 0;
     int m_screenW = 1920;
     int m_screenH = 1080;
+    std::atomic<int> m_displayRefreshRate{ 144 };
     
     bool m_geometryDirty = true;
     

@@ -40,6 +40,7 @@ bool OverlayWindow::Create(HINSTANCE hInstance) {
     m_screenH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
     if (m_screenW <= 0) m_screenW = 1920;
     if (m_screenH <= 0) m_screenH = 1080;
+    m_displayRefreshRate.store(DetectRefreshRate(), std::memory_order_relaxed);
     
     m_hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
@@ -163,7 +164,7 @@ void OverlayWindow::StartRenderThread() {
         return 0;
     }, this, 0, NULL);
     if (m_renderThread) {
-        SetThreadPriority(m_renderThread, THREAD_PRIORITY_HIGHEST);
+        SetThreadPriority(m_renderThread, THREAD_PRIORITY_TIME_CRITICAL);
     }
 }
 
@@ -201,12 +202,53 @@ void OverlayWindow::ExtendInkIfDrawing(double x, double y) {
     }
 }
 
+int OverlayWindow::DetectRefreshRate() {
+    // 1. Query DWM composition timing (exact compositor VSync presentation rate, e.g. 144.001 Hz)
+    DWM_TIMING_INFO ti = { sizeof(DWM_TIMING_INFO) };
+    if (SUCCEEDED(DwmGetCompositionTimingInfo(NULL, &ti))) {
+        if (ti.rateRefresh.uiDenominator > 0 && ti.rateRefresh.uiNumerator > 0) {
+            int rate = (int)((double)ti.rateRefresh.uiNumerator / (double)ti.rateRefresh.uiDenominator + 0.5);
+            if (rate >= 30) return rate;
+        }
+    }
+    
+    // 2. Query specific monitor where the overlay window is located (supports mixed 60Hz/144Hz multi-monitors)
+    HMONITOR hMon = MonitorFromWindow(m_hwnd ? m_hwnd : GetDesktopWindow(), MONITOR_DEFAULTTONEAREST);
+    if (hMon) {
+        MONITORINFOEXW mi = { sizeof(MONITORINFOEXW) };
+        if (GetMonitorInfoW(hMon, &mi)) {
+            DEVMODEW dm = { sizeof(DEVMODEW) };
+            if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) {
+                if (dm.dmDisplayFrequency > 1) {
+                    return (int)dm.dmDisplayFrequency;
+                }
+            }
+        }
+    }
+    
+    // 3. Fallback to primary display settings
+    DEVMODEW dm = { sizeof(DEVMODEW) };
+    if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm)) {
+        if (dm.dmDisplayFrequency > 1) {
+            return (int)dm.dmDisplayFrequency;
+        }
+    }
+    return 144;
+}
+
 void OverlayWindow::RenderThreadProc() {
     timeBeginPeriod(1);
+    
+    int targetFps = DetectRefreshRate();
+    if (targetFps < 30) targetFps = 144;
+    m_displayRefreshRate.store(targetFps, std::memory_order_relaxed);
     
     BOOL dwmEnabled = FALSE;
     HRESULT hr = DwmIsCompositionEnabled(&dwmEnabled);
     if (FAILED(hr)) dwmEnabled = FALSE;
+    
+    LARGE_INTEGER qpcFreq;
+    QueryPerformanceFrequency(&qpcFreq);
     
     while (m_renderThreadRunning.load(std::memory_order_relaxed)) {
         if (!m_isActive.load(std::memory_order_relaxed)) {
@@ -219,7 +261,7 @@ void OverlayWindow::RenderThreadProc() {
         if (GetCursorPos(&curPt)) {
             double prevX = m_cursorX.load(std::memory_order_relaxed);
             double prevY = m_cursorY.load(std::memory_order_relaxed);
-            if (curPt.x != (int)prevX || curPt.y != (int)prevY) {
+            if (std::abs(curPt.x - prevX) >= 0.5 || std::abs(curPt.y - prevY) >= 0.5) {
                 m_cursorX.store((double)curPt.x, std::memory_order_relaxed);
                 m_cursorY.store((double)curPt.y, std::memory_order_relaxed);
                 m_lastMoveTime.store(GetTickCount64(), std::memory_order_relaxed);
@@ -235,7 +277,7 @@ void OverlayWindow::RenderThreadProc() {
         {
             std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
             ULONGLONG now = GetTickCount64();
-            bool isMoving = (now - m_lastMoveTime.load(std::memory_order_relaxed)) < 100;
+            bool isMoving = (now - m_lastMoveTime.load(std::memory_order_relaxed)) < 150;
             bool isAnimating = m_arm.IsSettling() || m_ink.IsDrawing() || 
                                (m_settings.fadeSeconds > 0 && m_ink.StrokeCount() > 0) ||
                                m_toolbar.IsRevealed() || m_held.load(std::memory_order_relaxed) ||
@@ -244,20 +286,54 @@ void OverlayWindow::RenderThreadProc() {
         }
         
         if (needRender) {
+            LARGE_INTEGER frameStart;
+            QueryPerformanceCounter(&frameStart);
+            
             {
                 std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
                 TickAndRender();
             }
+            
+            bool flushed = false;
             if (dwmEnabled) {
-                if (FAILED(DwmFlush())) {
-                    Sleep(7);
+                LARGE_INTEGER flushStart;
+                QueryPerformanceCounter(&flushStart);
+                if (SUCCEEDED(DwmFlush())) {
+                    LARGE_INTEGER flushEnd;
+                    QueryPerformanceCounter(&flushEnd);
+                    double flushMs = (double)(flushEnd.QuadPart - flushStart.QuadPart) * 1000.0 / qpcFreq.QuadPart;
+                    // Ensure DwmFlush actually blocked for a VBlank interval (>= 0.5ms)
+                    if (flushMs >= 0.5) {
+                        flushed = true;
+                    }
                 }
-            } else {
-                Sleep(7);
+            }
+            
+            if (!flushed) {
+                int curFps = m_displayRefreshRate.load(std::memory_order_relaxed);
+                if (curFps < 30) curFps = 144;
+                double targetFrameMs = 1000.0 / curFps;
+                
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                double elapsedMs = (double)(now.QuadPart - frameStart.QuadPart) * 1000.0 / qpcFreq.QuadPart;
+                if (elapsedMs < targetFrameMs) {
+                    DWORD sleepMs = (DWORD)(targetFrameMs - elapsedMs);
+                    if (sleepMs > 1) {
+                        Sleep(sleepMs - 1);
+                    }
+                    while (true) {
+                        QueryPerformanceCounter(&now);
+                        if ((double)(now.QuadPart - frameStart.QuadPart) * 1000.0 / qpcFreq.QuadPart >= targetFrameMs) {
+                            break;
+                        }
+                    }
+                }
             }
         } else {
-            // Polling interval of 8ms ensures ultra-smooth responsiveness (~120Hz)
-            WaitForSingleObject(m_hWakeEvent, 8);
+            // Polling interval of 4ms ensures ultra-smooth responsiveness (250Hz OS cursor polling)
+            // and instantaneous wakeup when input hook fires (<0.05ms)
+            WaitForSingleObject(m_hWakeEvent, 4);
         }
     }
     
@@ -319,7 +395,7 @@ bool OverlayWindow::Activate() {
     InputHook::Instance().Install();
     InputHook::Instance().SetActive(true);
     
-    m_timerId = SetTimer(m_hwnd, 1, 16, NULL);
+    // Presentation loop is driven by RenderThreadProc at 144Hz VSync without 16ms timer judder
     StartRenderThread();
     if (m_hWakeEvent) SetEvent(m_hWakeEvent);
     
@@ -524,7 +600,9 @@ void OverlayWindow::TickAndRender() {
     blend.SourceConstantAlpha = 255;
     blend.AlphaFormat = AC_SRC_ALPHA;
     
-    UpdateLayeredWindow(m_hwnd, NULL, &ptDst, &sz, m_hdcMem[backIdx], &ptSrc, 0, &blend, ULW_ALPHA);
+    UpdateLayeredWindow(m_hwnd, NULL, m_geometryDirty ? &ptDst : NULL,
+                        m_geometryDirty ? &sz : NULL,
+                        m_hdcMem[backIdx], &ptSrc, 0, &blend, ULW_ALPHA);
     m_geometryDirty = false;
     m_frontBuffer = backIdx;
     m_needsRedraw.store(false, std::memory_order_relaxed);
@@ -556,6 +634,7 @@ LRESULT OverlayWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         
     case WM_DISPLAYCHANGE: {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        m_displayRefreshRate.store(DetectRefreshRate(), std::memory_order_relaxed);
         int newX = GetSystemMetrics(SM_XVIRTUALSCREEN);
         int newY = GetSystemMetrics(SM_YVIRTUALSCREEN);
         int newW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
