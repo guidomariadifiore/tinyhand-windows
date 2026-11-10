@@ -2,6 +2,9 @@
 .build/
 .swiftpm/
 dist/
+build/
+*.obj
+*.exe
 *.dmg
 *.zip
 assets/unused/

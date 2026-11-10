@@ -33,6 +33,32 @@ Open `TinyHand.dmg`, drag TinyHand to Applications and allow **Accessibility** w
 While the pointer is on, a small toolbar at the bottom of the screen lets you pick one of
 36 hands or a laser dot, mute the tap sound, or exit.
 
+## Windows
+
+TinyHand has a native Windows port!
+
+### Build
+Run `build-windows.bat` from Developer Command Prompt or PowerShell with Visual Studio C++ tools installed:
+```cmd
+build-windows.bat
+```
+The binary is generated at `dist\TinyHand.exe`.
+
+### Use on Windows
+
+| | |
+|---|---|
+| Click the system tray icon, or **Ctrl+Alt+H** | Turn the pointer on or off |
+| Right-click the system tray icon | Menu and Settings |
+| Click | Tap (underlying screen/video is never clicked or paused) |
+| Hold and drag | Draw on the screen |
+| Hold **Alt** | Click through normally (interact mode) |
+| **Ctrl+Alt+X** | Clear the drawing |
+| **Esc** | Clear everything and turn the pointer off |
+
+### Video Playback & Screen Non-Interference
+The overlay uses transparent layered window styles (`WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW`) combined with low-level click consumption (`WH_MOUSE_LL`). When watching video (YouTube, Netflix, media players), opening TinyHand or clicking never steals focus, never triggers background browser tab throttling, and never pauses video playback.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
