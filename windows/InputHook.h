@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <functional>
 #include <vector>
+#include <mutex>
 
 namespace TinyHand {
 
@@ -51,6 +52,11 @@ private:
     UINT m_interactVk = VK_MENU; // Default Alt
     
     std::vector<RECT> m_passThroughRects;
+    
+    mutable std::mutex m_sysUIMutex;
+    mutable POINT m_cachedSysUIPt = { -99999, -99999 };
+    mutable ULONGLONG m_cachedSysUITime = 0;
+    mutable bool m_cachedSysUIResult = false;
 };
 
 } // namespace TinyHand

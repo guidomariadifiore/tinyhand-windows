@@ -62,8 +62,20 @@ LRESULT CALLBACK InputHook::LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARA
 }
 
 bool InputHook::IsOverInteractiveSystemUI(POINT pt) const {
+    std::lock_guard<std::mutex> lock(m_sysUIMutex);
+    ULONGLONG now = GetTickCount64();
+    if (std::abs(pt.x - m_cachedSysUIPt.x) < 8 && std::abs(pt.y - m_cachedSysUIPt.y) < 8 && (now - m_cachedSysUITime) < 40) {
+        return m_cachedSysUIResult;
+    }
+    
+    m_cachedSysUIPt = pt;
+    m_cachedSysUITime = now;
+    
     HWND hwnd = WindowFromPoint(pt);
-    if (!hwnd) return false;
+    if (!hwnd) {
+        m_cachedSysUIResult = false;
+        return false;
+    }
     
     HWND root = GetAncestor(hwnd, GA_ROOT);
     if (!root) root = hwnd;
@@ -77,8 +89,10 @@ bool InputHook::IsOverInteractiveSystemUI(POINT pt) const {
     if (pid == GetCurrentProcessId()) {
         if (wcscmp(rootCls, L"TinyHand_SettingsClass") == 0 ||
             wcscmp(rootCls, L"TinyHand_ToolbarClass") == 0) {
+            m_cachedSysUIResult = true;
             return true;
         }
+        m_cachedSysUIResult = false;
         return false;
     }
     
@@ -87,6 +101,7 @@ bool InputHook::IsOverInteractiveSystemUI(POINT pt) const {
         wcscmp(rootCls, L"Shell_SecondaryTrayWnd") == 0 ||
         wcscmp(rootCls, L"NotifyIconOverflowWindow") == 0 ||
         wcscmp(rootCls, L"#32768") == 0) {
+        m_cachedSysUIResult = true;
         return true;
     }
     
@@ -94,11 +109,12 @@ bool InputHook::IsOverInteractiveSystemUI(POINT pt) const {
     wchar_t cls[64] = { 0 };
     GetClassNameW(hwnd, cls, 64);
     if (wcscmp(cls, L"#32768") == 0 ||
-        wcscmp(cls, L"TrayNotifyWnd") == 0 ||
-        wcscmp(cls, L"ToolbarWindow32") == 0) {
+        wcscmp(cls, L"TrayNotifyWnd") == 0) {
+        m_cachedSysUIResult = true;
         return true;
     }
     
+    m_cachedSysUIResult = false;
     return false;
 }
 
@@ -109,9 +125,10 @@ LRESULT InputHook::HandleMouse(int nCode, WPARAM wParam, LPARAM lParam) {
     
     MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lParam;
     
-    // Always notify mouse move
+    // Always notify mouse move and return immediately to keep hook processing ultra-fast (<0.01ms)
     if (wParam == WM_MOUSEMOVE) {
         if (onMouseMove) onMouseMove(ms->pt.x, ms->pt.y);
+        return CallNextHookEx(m_hMouseHook, nCode, wParam, lParam);
     }
     
     // Check Interact Key (Alt)

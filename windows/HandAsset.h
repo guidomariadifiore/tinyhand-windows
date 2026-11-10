@@ -9,6 +9,10 @@ namespace TinyHand {
 struct HandAsset {
     std::shared_ptr<Gdiplus::Bitmap> image;
     std::shared_ptr<Gdiplus::Bitmap> thumbnail;
+    std::shared_ptr<Gdiplus::Bitmap> displayImage;
+    std::shared_ptr<Gdiplus::Bitmap> displayShadow;
+    int displayH = 0;
+    int displayW = 0;
     double aspect = 0.666;
     double handTop = 0.07;
     double tip = 0.08;
@@ -18,6 +22,11 @@ struct HandAsset {
     double rodX = 0.5;
     double handMinX = 0.2;
     double handMaxX = 0.8;
+    double rodMinX = 0.45;
+    double rodMaxX = 0.55;
+    std::mutex mutex;
+    
+    void EnsureDisplayImages(int targetH = 512);
 };
 
 class HandAssetManager {

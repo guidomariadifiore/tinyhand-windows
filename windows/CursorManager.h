@@ -5,6 +5,7 @@
 #endif
 
 #include <windows.h>
+#include <mutex>
 
 namespace TinyHand {
 
@@ -24,6 +25,7 @@ private:
     HCURSOR CreateBlankCursor();
     
     bool m_isHidden = false;
+    mutable std::mutex m_mutex;
 };
 
 } // namespace TinyHand

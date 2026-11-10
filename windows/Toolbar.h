@@ -2,6 +2,7 @@
 
 #include "Common.h"
 #include <functional>
+#include <mutex>
 
 namespace TinyHand {
 
@@ -56,11 +57,18 @@ public:
 
 private:
     void Render();
+    void RenderContent();
     void RecalculateLayout();
     ToolbarItem* HitTest(int x, int y);
     
     HWND m_hwnd = NULL;
     HINSTANCE m_hInstance = NULL;
+    HDC m_hdcMem = NULL;
+    HBITMAP m_hBitmap = NULL;
+    HGDIOBJ m_hOldBitmap = NULL;
+    void* m_bits = NULL;
+    bool m_contentDirty = true;
+    mutable std::recursive_mutex m_toolbarMutex;
     
     PointerStyleId m_currentStyle = PointerStyleId::Lavender;
     std::vector<PointerStyleId> m_pinnedStyles;

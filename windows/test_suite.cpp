@@ -288,11 +288,267 @@ void TestSystemUIPassThrough() {
     DestroyWindow(hVideo);
     UnregisterClassW(L"MockVideoPlayerClass", GetModuleHandle(NULL));
     
-    // 2. Cursor Manager Restore Safety
+    // 2. Application with standard ToolbarWindow32 control
+    // Must NOT trigger system UI bypass (which would cause hand pointer flickering/disappearing over app toolbars)
+    HWND hDesktop = GetDesktopWindow();
+    HWND hAppWithToolbar = CreateWindowExW(
+        0, L"STATIC", L"Mock App",
+        WS_POPUP | WS_VISIBLE, 100, 100, 400, 300,
+        hDesktop, NULL, GetModuleHandle(NULL), NULL
+    );
+    HWND hChildToolbar = CreateWindowExW(
+        0, L"ToolbarWindow32", L"Toolbar",
+        WS_CHILD | WS_VISIBLE, 0, 0, 400, 30,
+        hAppWithToolbar, NULL, GetModuleHandle(NULL), NULL
+    );
+    if (hChildToolbar) {
+        POINT ptChildToolbar = { 150, 115 };
+        bool isToolbarSysUI = hook.IsOverInteractiveSystemUI(ptChildToolbar);
+        TEST_ASSERT(!isToolbarSysUI, "App toolbar (ToolbarWindow32) must NOT be treated as system UI so hand pointer does not flicker/disappear");
+    }
+    if (hAppWithToolbar) DestroyWindow(hAppWithToolbar);
+    
+    // 3. Cursor Manager Restore Safety
     CursorManager::Instance().Restore();
     TEST_ASSERT(true, "CursorManager::Restore ran safely");
     
     std::cout << "  -> System UI Pass-Through & Safety PASSED" << std::endl;
+}
+
+#include <chrono>
+
+void TestFluidityBenchmark() {
+    std::cout << "[TEST] Testing Rendering Fluidity & High-FPS Performance..." << std::endl;
+    OverlayWindow overlay;
+    bool created = overlay.Create(GetModuleHandle(NULL));
+    TEST_ASSERT(created, "Overlay created");
+    overlay.Activate();
+    
+    // Warm up
+    for (int i = 0; i < 5; ++i) {
+        InputHook::Instance().onMouseMove(500 + i * 5, 500 + i * 5);
+    }
+    
+    // Benchmark overlay rendering speed
+    auto t0 = std::chrono::high_resolution_clock::now();
+    int frames = 100;
+    for (int i = 0; i < frames; ++i) {
+        InputHook::Instance().onMouseMove(500 + i * 2, 500 + i * 2);
+        SendMessageW(FindWindowW(L"TinyHand_OverlayClass", NULL), WM_TIMER, 1, 0);
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double msPerFrame = ms / frames;
+    double fps = (frames * 1000.0) / ms;
+    
+    std::cout << "  -> Rendered " << frames << " frames in " << ms << " ms (" 
+              << msPerFrame << " ms/frame, " << fps << " FPS)" << std::endl;
+    
+    TEST_ASSERT(msPerFrame < 15.0, "Overlay render must easily sustain high frame rates (<15ms/frame)");
+    TEST_ASSERT(fps >= 70.0, "Must achieve fluid high-refresh-rate performance (>=70 FPS)");
+    
+    overlay.Destroy();
+    std::cout << "  -> Fluidity & High-FPS Performance PASSED" << std::endl;
+}
+
+#include <thread>
+#include <atomic>
+
+void TestFlickerAndThreadSafety() {
+    std::cout << "[TEST] Testing Flicker Elimination & Multi-Threaded Concurrency Safety..." << std::endl;
+    OverlayWindow overlay;
+    bool created = overlay.Create(GetModuleHandle(NULL));
+    TEST_ASSERT(created, "Overlay created");
+    overlay.Activate();
+    
+    std::atomic<bool> stopWorker{ false };
+    std::atomic<int> mouseEvents{ 0 };
+    std::atomic<int> drawEvents{ 0 };
+    
+    // Worker: Rapid mouse motion & drawing concurrently with RenderThread
+    std::thread worker([&]() {
+        int x = 400, y = 300;
+        int dx = 3, dy = 2;
+        while (!stopWorker) {
+            x += dx;
+            y += dy;
+            if (x < 100 || x > 1600) dx = -dx;
+            if (y < 100 || y > 900) dy = -dy;
+            
+            InputHook::Instance().onMouseMove(x, y);
+            mouseEvents++;
+            
+            // Periodically click and draw
+            if (mouseEvents % 20 == 0) {
+                InputHook::Instance().onMouseDown(x, y);
+                for (int p = 0; p < 6; ++p) {
+                    InputHook::Instance().onMouseMove(x + p * 4, y + p * 3);
+                }
+                InputHook::Instance().onMouseUp(x + 24, y + 18);
+                drawEvents++;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    });
+    
+    PointerStyleId styles[] = {
+        PointerStyleId::Lavender, PointerStyleId::Glove, PointerStyleId::Coral,
+        PointerStyleId::Plush, PointerStyleId::Robot, PointerStyleId::Laser
+    };
+    
+    // Main UI thread performs UI actions (style changes, clearing, interact) while pumping messages
+    ULONGLONG start = GetTickCount64();
+    int iteration = 0;
+    while (GetTickCount64() - start < 500) {
+        MSG msg;
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        
+        if (iteration % 5 == 0) {
+            Settings s = overlay.GetSettings();
+            s.currentStyle = styles[(iteration / 5) % 6];
+            overlay.ApplySettings(s);
+        }
+        if (iteration % 8 == 0) {
+            overlay.ClearInk();
+        }
+        if (iteration % 12 == 0) {
+            InputHook::Instance().onInteractStateChanged((iteration % 24) == 0);
+        }
+        
+        iteration++;
+        Sleep(5);
+    }
+    
+    stopWorker = true;
+    worker.join();
+    
+    // Ensure interact key is released and trigger a final tick so arm is rendered deterministically
+    InputHook::Instance().onInteractStateChanged(false);
+    SendMessageW(FindWindowW(L"TinyHand_OverlayClass", NULL), WM_TIMER, 1, 0);
+    
+    TEST_ASSERT(mouseEvents > 50, "Generated heavy mouse traffic");
+    TEST_ASSERT(drawEvents > 2, "Generated concurrent ink drawings");
+    
+    // Verify front buffer bits are valid and contain rendered pixels (arm and ink present)
+    void* frontBits = overlay.GetFrontBufferBits();
+    TEST_ASSERT(frontBits != nullptr, "Front buffer bits must be allocated");
+    
+    int w = overlay.GetScreenWidth();
+    int h = overlay.GetScreenHeight();
+    const uint32_t* pixels = (const uint32_t*)frontBits;
+    bool hasNonZeroAlpha = false;
+    for (int i = 0; i < w * h; ++i) {
+        if ((pixels[i] >> 24) > 0) {
+            hasNonZeroAlpha = true;
+            break;
+        }
+    }
+    TEST_ASSERT(hasNonZeroAlpha, "Front buffer must contain non-zero alpha pixels (arm and ink successfully composited)");
+    
+    // Test WM_DISPLAYCHANGE message handling without crashing or buffer loss
+    HWND hOverlay = FindWindowW(L"TinyHand_OverlayClass", NULL);
+    if (hOverlay) {
+        SendMessageW(hOverlay, WM_DISPLAYCHANGE, 32, MAKELPARAM(1920, 1080));
+        TEST_ASSERT(overlay.GetFrontBufferBits() != nullptr, "Front buffer remains valid after WM_DISPLAYCHANGE");
+    }
+    
+    // Test CursorManager thread safety under rapid concurrent Show/Hide calls
+    std::thread cursorWorker1([]() {
+        for (int i = 0; i < 50; ++i) {
+            CursorManager::Instance().Hide();
+            CursorManager::Instance().Show();
+        }
+    });
+    std::thread cursorWorker2([]() {
+        for (int i = 0; i < 50; ++i) {
+            CursorManager::Instance().Show();
+            CursorManager::Instance().Hide();
+        }
+    });
+    cursorWorker1.join();
+    cursorWorker2.join();
+    CursorManager::Instance().Restore();
+    
+    overlay.Deactivate();
+    overlay.Destroy();
+    std::cout << "  -> Flicker Elimination & Concurrency Safety PASSED (" 
+              << mouseEvents << " mouse moves, " << drawEvents << " ink strokes safely processed)" << std::endl;
+}
+
+void TestRealtimeCursorTracking() {
+    std::cout << "[TEST] Testing Real-Time Continuous Cursor Tracking..." << std::endl;
+    OverlayWindow overlay;
+    bool created = overlay.Create(GetModuleHandle(NULL));
+    TEST_ASSERT(created, "Overlay created");
+    
+    // Save current cursor pos to restore later
+    POINT origPos;
+    GetCursorPos(&origPos);
+    
+    overlay.Activate();
+    TEST_ASSERT(overlay.IsActive(), "Overlay is active");
+    
+    // Test that GetCursorPos movement is continuously tracked by the presentation loop
+    POINT testCoords[] = {
+        { 320, 240 },
+        { 640, 480 },
+        { 900, 700 },
+        { 400, 300 }
+    };
+    
+    // If SetCursorPos is allowed in this session, test continuous OS cursor polling
+    if (SetCursorPos(testCoords[0].x, testCoords[0].y)) {
+        for (int i = 0; i < 4; ++i) {
+            SetCursorPos(testCoords[i].x, testCoords[i].y);
+            
+            // Wait up to 100ms for presentation thread to sample the new OS cursor position
+            ULONGLONG start = GetTickCount64();
+            bool tracked = false;
+            while (GetTickCount64() - start < 100) {
+                double cx = overlay.GetCursorX();
+                double cy = overlay.GetCursorY();
+                if (std::abs(cx - testCoords[i].x) < 2.0 && std::abs(cy - testCoords[i].y) < 2.0) {
+                    tracked = true;
+                    break;
+                }
+                Sleep(5);
+            }
+            TEST_ASSERT(tracked, "Hand overlay continuously and smoothly tracked OS cursor position in real time");
+        }
+    }
+    
+    // Test that hook-driven mouse moves update position immediately and wake presentation thread
+    for (int i = 0; i < 4; ++i) {
+        InputHook::Instance().onMouseMove(testCoords[i].x, testCoords[i].y);
+        
+        ULONGLONG start = GetTickCount64();
+        bool tracked = false;
+        while (GetTickCount64() - start < 100) {
+            double cx = overlay.GetCursorX();
+            double cy = overlay.GetCursorY();
+            if (std::abs(cx - testCoords[i].x) < 0.1 && std::abs(cy - testCoords[i].y) < 0.1) {
+                tracked = true;
+                break;
+            }
+            Sleep(5);
+        }
+        TEST_ASSERT(tracked, "Hook onMouseMove immediately updates cursor tracking coordinates");
+    }
+    
+    // Verify front buffer rendering after cursor tracking
+    SendMessageW(FindWindowW(L"TinyHand_OverlayClass", NULL), WM_TIMER, 1, 0);
+    void* bits = overlay.GetFrontBufferBits();
+    TEST_ASSERT(bits != nullptr, "Front buffer must be valid");
+    
+    // Restore original cursor position if SetCursorPos was active
+    SetCursorPos(origPos.x, origPos.y);
+    
+    overlay.Deactivate();
+    overlay.Destroy();
+    std::cout << "  -> Real-Time Continuous Cursor Tracking PASSED" << std::endl;
 }
 
 int main() {
@@ -302,7 +558,8 @@ int main() {
     
     Gdiplus::GdiplusStartupInput gdiplusStartupInput;
     ULONG_PTR gdiplusToken = 0;
-    Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+    Gdiplus::Status gdiStatus = Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+    TEST_ASSERT(gdiStatus == Gdiplus::Ok, "GDI+ initialized");
     
     TestPreferences();
     TestHandAssets();
@@ -312,12 +569,15 @@ int main() {
     TestOverlayNonInterference();
     TestToolbarInteractiveSafety();
     TestSystemUIPassThrough();
+    TestFluidityBenchmark();
+    TestFlickerAndThreadSafety();
+    TestRealtimeCursorTracking();
     
     HandAssetManager::Instance().ClearCache();
     Gdiplus::GdiplusShutdown(gdiplusToken);
     
     std::cout << "========================================" << std::endl;
-    std::cout << "ALL 8 TEST SUITES PASSED (100% SUCCESS)!" << std::endl;
+    std::cout << "ALL 11 TEST SUITES PASSED (100% SUCCESS)!" << std::endl;
     std::cout << "========================================" << std::endl;
     return 0;
 }

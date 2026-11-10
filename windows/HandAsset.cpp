@@ -183,11 +183,28 @@ std::shared_ptr<HandAsset> HandAssetManager::LoadAndMeasure(const std::wstring& 
     for (int y = top; y < wrist; ++y) {
         int row = y * w;
         for (int x = 0; x < w; ++x) {
-            if (alpha[row + x] > 128) {
+            if (alpha[row + x] > 16) {
                 if (x < minX) minX = x;
                 if (x > maxX) maxX = x;
             }
         }
+    }
+    
+    int rodMin = w, rodMax = 0;
+    for (int y = wrist; y <= rodEnd; ++y) {
+        int row = y * w;
+        for (int x = 0; x < w; ++x) {
+            if (alpha[row + x] > 16) {
+                if (x < rodMin) rodMin = x;
+                if (x > rodMax) rodMax = x;
+            }
+        }
+    }
+    if (rodMin >= rodMax) {
+        int cx = (int)(center((wrist + rodEnd) / 2) * w);
+        int halfW = (std::max)(15, rodW / 2 + 5);
+        rodMin = (std::max)(0, cx - halfW);
+        rodMax = (std::min)(w - 1, cx + halfW);
     }
     
     double fh = (double)h;
@@ -200,11 +217,68 @@ std::shared_ptr<HandAsset> HandAssetManager::LoadAndMeasure(const std::wstring& 
     asset->rodEnd = (double)rodEnd / fh;
     asset->tipX = center((std::min)(h - 1, top + h / 200));
     asset->rodX = center((wrist + rodEnd) / 2);
-    asset->handMinX = (double)minX / (double)w;
-    asset->handMaxX = (double)maxX / (double)w;
+    asset->handMinX = (std::max)(0.0, (double)(minX - 4) / (double)w);
+    asset->handMaxX = (std::min)(1.0, (double)(maxX + 4) / (double)w);
+    asset->rodMinX = (std::max)(0.0, (double)(rodMin - 4) / (double)w);
+    asset->rodMaxX = (std::min)(1.0, (double)(rodMax + 4) / (double)w);
     
+    asset->EnsureDisplayImages(512);
     asset->thumbnail = GenerateThumbnail(*asset);
     return asset;
+}
+
+void HandAsset::EnsureDisplayImages(int targetH) {
+    if (targetH <= 0) targetH = 512;
+    if (displayH == targetH && displayImage && displayShadow) return;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (displayH == targetH && displayImage && displayShadow) return;
+    if (!image) return;
+    
+    int origW = image->GetWidth();
+    int origH = image->GetHeight();
+    if (origW <= 0 || origH <= 0) return;
+    
+    int targetW = (int)std::round(targetH * aspect);
+    if (targetW <= 0) targetW = (int)std::round(targetH * (double)origW / (double)origH);
+    if (targetW <= 0) targetW = 340;
+    
+    auto newDisplayImage = std::make_shared<Gdiplus::Bitmap>(targetW, targetH, PixelFormat32bppPARGB);
+    {
+        Gdiplus::Graphics g(newDisplayImage.get());
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        g.Clear(Gdiplus::Color(0, 0, 0, 0));
+        g.DrawImage(image.get(), 0, 0, targetW, targetH);
+    }
+    
+    auto newDisplayShadow = std::make_shared<Gdiplus::Bitmap>(targetW, targetH, PixelFormat32bppPARGB);
+    {
+        Gdiplus::BitmapData srcData, dstData;
+        Gdiplus::Rect r(0, 0, targetW, targetH);
+        if (newDisplayImage->LockBits(&r, Gdiplus::ImageLockModeRead, PixelFormat32bppPARGB, &srcData) == Gdiplus::Ok) {
+            if (newDisplayShadow->LockBits(&r, Gdiplus::ImageLockModeWrite, PixelFormat32bppPARGB, &dstData) == Gdiplus::Ok) {
+                for (int y = 0; y < targetH; ++y) {
+                    const BYTE* srcRow = (const BYTE*)srcData.Scan0 + y * srcData.Stride;
+                    BYTE* dstRow = (BYTE*)dstData.Scan0 + y * dstData.Stride;
+                    for (int x = 0; x < targetW; ++x) {
+                        BYTE a = srcRow[x * 4 + 3];
+                        BYTE shadowA = (BYTE)((int)a * 27 / 100);
+                        dstRow[x * 4 + 0] = 0;
+                        dstRow[x * 4 + 1] = 0;
+                        dstRow[x * 4 + 2] = 0;
+                        dstRow[x * 4 + 3] = shadowA;
+                    }
+                }
+                newDisplayShadow->UnlockBits(&dstData);
+            }
+            newDisplayImage->UnlockBits(&srcData);
+        }
+    }
+    
+    displayImage = newDisplayImage;
+    displayShadow = newDisplayShadow;
+    displayW = targetW;
+    displayH = targetH;
 }
 
 std::shared_ptr<Gdiplus::Bitmap> HandAssetManager::GenerateThumbnail(const HandAsset& asset) {

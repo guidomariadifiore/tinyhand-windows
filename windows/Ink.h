@@ -2,6 +2,7 @@
 
 #include "Common.h"
 #include <vector>
+#include <mutex>
 
 namespace TinyHand {
 
@@ -34,6 +35,7 @@ public:
     void Render(Gdiplus::Graphics& g, double fadeDelay, ULONGLONG now);
     
 private:
+    mutable std::mutex m_mutex;
     std::vector<InkStroke> m_strokes;
 };
 

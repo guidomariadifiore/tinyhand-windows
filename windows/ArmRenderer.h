@@ -3,6 +3,7 @@
 #include "Common.h"
 #include "HandAsset.h"
 #include "Ink.h"
+#include <chrono>
 
 namespace TinyHand {
 
@@ -28,6 +29,10 @@ private:
     double m_gripX = -1.0;
     double m_gripTarget = -1.0;
     bool m_hasGrip = false;
+    std::chrono::steady_clock::time_point m_lastStepTime;
+    std::chrono::steady_clock::time_point m_lastGripTime;
+    bool m_hasStepTime = false;
+    bool m_hasGripTime = false;
 };
 
 } // namespace TinyHand

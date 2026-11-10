@@ -41,6 +41,7 @@ HCURSOR CursorManager::CreateBlankCursor() {
 }
 
 void CursorManager::Hide() {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (m_isHidden) return;
     
     const DWORD cursorIds[] = {
@@ -72,11 +73,14 @@ void CursorManager::Hide() {
 }
 
 void CursorManager::Show() {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_isHidden) return;
-    Restore();
+    SystemParametersInfoW(SPI_SETCURSORS, 0, NULL, 0);
+    m_isHidden = false;
 }
 
 void CursorManager::Restore() {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (m_isHidden) {
         SystemParametersInfoW(SPI_SETCURSORS, 0, NULL, 0);
         m_isHidden = false;

@@ -14,11 +14,24 @@ void ArmRenderer::Press() {
 void ArmRenderer::ResetGrip() {
     m_hasGrip = false;
     m_pressAmount = 0.0;
+    m_hasStepTime = false;
+    m_hasGripTime = false;
 }
 
 void ArmRenderer::StepAnimation(bool held) {
+    auto now = std::chrono::steady_clock::now();
+    double dt = 0.008;
+    if (m_hasStepTime) {
+        dt = std::chrono::duration<double>(now - m_lastStepTime).count();
+    }
+    m_lastStepTime = now;
+    m_hasStepTime = true;
+    if (dt > 0.1) dt = 0.1;
+    if (dt < 0.0005) dt = 0.0005;
+    
     if (!held) {
-        m_pressAmount += (0.0 - m_pressAmount) * 0.18;
+        double decay = 1.0 - std::pow((std::max)(0.0, 1.0 - 0.18), dt / 0.008);
+        m_pressAmount += (0.0 - m_pressAmount) * decay;
         if (m_pressAmount < 0.001) m_pressAmount = 0.0;
     }
 }
@@ -68,17 +81,28 @@ void ArmRenderer::RenderArm(Gdiplus::Graphics& g, PointerStyleId style, double c
     const double minRodFrac = 0.05;
     const double gripLeanFrac = 0.30;
     const double gripDepthFrac = 0.12;
-    const double gripFollow = 0.08;
+    const double gripFollow = 0.12;
     const double liftFrac = 0.06;
     
     double targetX = (std::min)((std::max)(cursorX + gripLeanFrac * screenW, screenW * 0.15), screenW * 1.05);
     m_gripTarget = targetX;
     
+    auto now = std::chrono::steady_clock::now();
+    double dt = 0.008;
+    if (m_hasGripTime) {
+        dt = std::chrono::duration<double>(now - m_lastGripTime).count();
+    }
+    m_lastGripTime = now;
+    m_hasGripTime = true;
+    if (dt > 0.05) dt = 0.05;
+    if (dt < 0.0005) dt = 0.0005;
+    
     if (!m_hasGrip) {
         m_gripX = targetX;
         m_hasGrip = true;
     } else {
-        m_gripX = m_gripX + (targetX - m_gripX) * gripFollow;
+        double gripDecay = 1.0 - std::pow((std::max)(0.0, 1.0 - gripFollow), dt / 0.008);
+        m_gripX = m_gripX + (targetX - m_gripX) * gripDecay;
     }
     
     double gx = m_gripX;
@@ -102,17 +126,26 @@ void ArmRenderer::RenderArm(Gdiplus::Graphics& g, PointerStyleId style, double c
     
     double lift = liftFrac * screenH * (1.0 - 0.8 * m_pressAmount);
     
-    int imgW = asset->image->GetWidth();
-    int imgH = asset->image->GetHeight();
+    int targetH = (screenH > 1440) ? 1024 : 512;
+    asset->EnsureDisplayImages(targetH);
     
-    auto drawPiece = [&](double startAlong, double lenAlong, double srcY, double srcH, double offX, double offY, Gdiplus::ImageAttributes* attr) {
+    Gdiplus::Bitmap* armBmp = asset->displayImage ? asset->displayImage.get() : asset->image.get();
+    Gdiplus::Bitmap* shadowBmp = asset->displayShadow ? asset->displayShadow.get() : nullptr;
+    
+    int imgW = armBmp->GetWidth();
+    int imgH = armBmp->GetHeight();
+    
+    auto drawPiece = [&](Gdiplus::Bitmap* bmp, double startAlong, double lenAlong,
+                         double srcMinNormX, double srcMaxNormX,
+                         double srcNormY, double srcNormH,
+                         double offX, double offY, Gdiplus::ImageAttributes* attr) {
         double ux = cos(rodAngle);
         double uy = sin(rodAngle);
         double vx = -sin(rodAngle);
         double vy = cos(rodAngle);
         
-        double leftEdge = -asset->rodX * widthPts;
-        double rightEdge = (1.0 - asset->rodX) * widthPts;
+        double leftEdge = (srcMinNormX - asset->rodX) * widthPts;
+        double rightEdge = (srcMaxNormX - asset->rodX) * widthPts;
         
         Gdiplus::PointF ptTL(
             (float)(gx + offX + ux * (startAlong + lenAlong) + vx * leftEdge),
@@ -128,32 +161,47 @@ void ArmRenderer::RenderArm(Gdiplus::Graphics& g, PointerStyleId style, double c
         );
         
         Gdiplus::PointF destPts[3] = { ptTL, ptTR, ptBL };
-        g.DrawImage(asset->image.get(), destPts, 3, 0.0f, (float)srcY, (float)imgW, (float)srcH, Gdiplus::UnitPixel, attr);
+        float srcX = (float)(srcMinNormX * imgW);
+        float srcW = (float)((srcMaxNormX - srcMinNormX) * imgW);
+        float srcY = (float)(srcNormY * imgH);
+        float srcH = (float)(srcNormH * imgH);
+        g.DrawImage(bmp, destPts, 3, srcX, srcY, srcW, srcH, Gdiplus::UnitPixel, attr);
     };
     
     // Shadow pass
     if (showShadow) {
-        Gdiplus::ImageAttributes shadowAttr;
-        float alpha = (float)(0.26 + 0.02 * m_pressAmount);
-        Gdiplus::ColorMatrix cm = {
-            0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0,
-            0, 0, 0, alpha, 0,
-            0, 0, 0, 0, 1
-        };
-        shadowAttr.SetColorMatrix(&cm, Gdiplus::ColorMatrixFlagsDefault, Gdiplus::ColorAdjustTypeBitmap);
-        
         double sx = lift * 0.6;
         double sy = lift;
         
-        drawPiece(0, rodLen, asset->wrist * imgH, (asset->rodEnd - asset->wrist) * imgH, sx, sy, &shadowAttr);
-        drawPiece(rodLen, handPts, asset->handTop * imgH, (asset->wrist - asset->handTop) * imgH, sx, sy, &shadowAttr);
+        if (shadowBmp) {
+            drawPiece(shadowBmp, 0, rodLen + 1.0, asset->rodMinX, asset->rodMaxX,
+                      asset->wrist, asset->rodEnd - asset->wrist, sx, sy, NULL);
+            drawPiece(shadowBmp, rodLen, handPts, asset->handMinX, asset->handMaxX,
+                      asset->handTop, asset->wrist - asset->handTop, sx, sy, NULL);
+        } else {
+            Gdiplus::ImageAttributes shadowAttr;
+            float alpha = (float)(0.26 + 0.02 * m_pressAmount);
+            Gdiplus::ColorMatrix cm = {
+                0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0,
+                0, 0, 0, alpha, 0,
+                0, 0, 0, 0, 1
+            };
+            shadowAttr.SetColorMatrix(&cm, Gdiplus::ColorMatrixFlagsDefault, Gdiplus::ColorAdjustTypeBitmap);
+            
+            drawPiece(armBmp, 0, rodLen + 1.0, asset->rodMinX, asset->rodMaxX,
+                      asset->wrist, asset->rodEnd - asset->wrist, sx, sy, &shadowAttr);
+            drawPiece(armBmp, rodLen, handPts, asset->handMinX, asset->handMaxX,
+                      asset->handTop, asset->wrist - asset->handTop, sx, sy, &shadowAttr);
+        }
     }
     
     // Actual rod and hand
-    drawPiece(0, rodLen, asset->wrist * imgH, (asset->rodEnd - asset->wrist) * imgH, 0, 0, NULL);
-    drawPiece(rodLen, handPts, asset->handTop * imgH, (asset->wrist - asset->handTop) * imgH, 0, 0, NULL);
+    drawPiece(armBmp, 0, rodLen + 1.0, asset->rodMinX, asset->rodMaxX,
+              asset->wrist, asset->rodEnd - asset->wrist, 0, 0, NULL);
+    drawPiece(armBmp, rodLen, handPts, asset->handMinX, asset->handMaxX,
+              asset->handTop, asset->wrist - asset->handTop, 0, 0, NULL);
 }
 
 } // namespace TinyHand

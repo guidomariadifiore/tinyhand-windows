@@ -48,6 +48,15 @@ bool ToolbarWindow::Create(HINSTANCE hInstance) {
 }
 
 void ToolbarWindow::Destroy() {
+    if (m_hdcMem) {
+        SelectObject(m_hdcMem, m_hOldBitmap);
+        DeleteDC(m_hdcMem);
+        m_hdcMem = NULL;
+    }
+    if (m_hBitmap) {
+        DeleteObject(m_hBitmap);
+        m_hBitmap = NULL;
+    }
     if (m_hwnd) {
         DestroyWindow(m_hwnd);
         m_hwnd = NULL;
@@ -66,22 +75,26 @@ void ToolbarWindow::Show(bool show) {
 
 void ToolbarWindow::SetCurrentStyle(PointerStyleId style) {
     m_currentStyle = style;
+    m_contentDirty = true;
     Render();
 }
 
 void ToolbarWindow::SetPinnedStyles(const std::vector<PointerStyleId>& pinned) {
     m_pinnedStyles = pinned;
+    m_contentDirty = true;
     RecalculateLayout();
     Render();
 }
 
 void ToolbarWindow::SetSoundEnabled(bool enabled) {
     m_soundEnabled = enabled;
+    m_contentDirty = true;
     Render();
 }
 
 void ToolbarWindow::SetInkChoice(InkChoiceId choice) {
     m_inkChoice = choice;
+    m_contentDirty = true;
     Render();
 }
 
@@ -132,6 +145,7 @@ bool ToolbarWindow::IsOverInteractive(double screenX, double screenY) const {
 }
 
 void ToolbarWindow::RecalculateLayout() {
+    std::lock_guard<std::recursive_mutex> lock(m_toolbarMutex);
     m_items.clear();
     
     const float btnSize = 36.0f;
@@ -225,6 +239,29 @@ void ToolbarWindow::RecalculateLayout() {
     if (m_hwnd) {
         SetWindowPos(m_hwnd, HWND_TOPMOST, m_windowX, m_windowY, m_windowW, m_windowH,
                      SWP_NOACTIVATE | SWP_NOZORDER);
+                     
+        HDC hdcScreen = GetDC(NULL);
+        if (!m_hdcMem) {
+            m_hdcMem = CreateCompatibleDC(hdcScreen);
+        }
+        if (m_hBitmap) {
+            SelectObject(m_hdcMem, m_hOldBitmap);
+            DeleteObject(m_hBitmap);
+            m_hBitmap = NULL;
+        }
+        
+        BITMAPINFO bmi = { sizeof(BITMAPINFOHEADER) };
+        bmi.bmiHeader.biWidth = m_windowW;
+        bmi.bmiHeader.biHeight = -m_windowH;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        
+        m_hBitmap = CreateDIBSection(hdcScreen, &bmi, DIB_RGB_COLORS, &m_bits, NULL, 0);
+        m_hOldBitmap = SelectObject(m_hdcMem, m_hBitmap);
+        ReleaseDC(NULL, hdcScreen);
+        
+        m_contentDirty = true;
     }
 }
 
@@ -239,6 +276,7 @@ ToolbarItem* ToolbarWindow::HitTest(int x, int y) {
 
 void ToolbarWindow::Update(double cursorX, double cursorY, double screenX, double screenY,
                            double screenW, double screenH, bool isDrawing, ULONGLONG now) {
+    std::lock_guard<std::recursive_mutex> lock(m_toolbarMutex);
     bool screenChanged = (m_screenX != screenX || m_screenY != screenY ||
                           m_screenW != screenW || m_screenH != screenH);
     if (screenChanged) {
@@ -275,37 +313,13 @@ static void AddRoundedRect(Gdiplus::GraphicsPath& path, Gdiplus::RectF r, float 
     path.CloseFigure();
 }
 
-void ToolbarWindow::Render() {
-    if (!m_hwnd || m_alpha <= 0.01f) {
-        if (m_hwnd && IsWindowVisible(m_hwnd) && m_alpha <= 0.01f) {
-            ShowWindow(m_hwnd, SW_HIDE);
-        }
-        return;
-    }
+void ToolbarWindow::RenderContent() {
+    if (!m_hdcMem || !m_bits) return;
     
-    if (!IsWindowVisible(m_hwnd)) {
-        ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
-    }
-    
-    HDC hdcScreen = GetDC(NULL);
-    HDC hdcMem = CreateCompatibleDC(hdcScreen);
-    
-    BITMAPINFO bmi = { sizeof(BITMAPINFOHEADER) };
-    bmi.bmiHeader.biWidth = m_windowW;
-    bmi.bmiHeader.biHeight = -m_windowH; // top-down
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-    
-    void* bits = NULL;
-    HBITMAP hBmp = CreateDIBSection(hdcScreen, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
-    HGDIOBJ hOldBmp = SelectObject(hdcMem, hBmp);
-    
-    {
-        Gdiplus::Graphics g(hdcMem);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-        g.Clear(Gdiplus::Color(0, 0, 0, 0));
+    Gdiplus::Graphics g(m_hdcMem);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    g.Clear(Gdiplus::Color(0, 0, 0, 0));
         
         // 1. Draw Toolbar background
         Gdiplus::GraphicsPath barPath;
@@ -488,6 +502,34 @@ void ToolbarWindow::Render() {
             }
         }
     }
+
+void ToolbarWindow::Render() {
+    std::lock_guard<std::recursive_mutex> lock(m_toolbarMutex);
+    if (!m_hwnd) return;
+    
+    if (m_alpha <= 0.005f) {
+        POINT ptDst = { m_windowX, m_windowY };
+        SIZE sz = { m_windowW, m_windowH };
+        POINT ptSrc = { 0, 0 };
+        BLENDFUNCTION blend = {};
+        blend.BlendOp = AC_SRC_OVER;
+        blend.BlendFlags = 0;
+        blend.SourceConstantAlpha = 0;
+        blend.AlphaFormat = AC_SRC_ALPHA;
+        if (m_hdcMem) {
+            UpdateLayeredWindow(m_hwnd, NULL, &ptDst, &sz, m_hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
+        }
+        return;
+    }
+    
+    if (!m_hdcMem) {
+        RecalculateLayout();
+    }
+    
+    if (m_contentDirty) {
+        RenderContent();
+        m_contentDirty = false;
+    }
     
     POINT ptDst = { m_windowX, m_windowY };
     SIZE sz = { m_windowW, m_windowH };
@@ -499,16 +541,21 @@ void ToolbarWindow::Render() {
     blend.SourceConstantAlpha = (BYTE)(m_alpha * 255.0f);
     blend.AlphaFormat = AC_SRC_ALPHA;
     
-    UpdateLayeredWindow(m_hwnd, hdcScreen, &ptDst, &sz, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
-    
-    SelectObject(hdcMem, hOldBmp);
-    DeleteObject(hBmp);
-    DeleteDC(hdcMem);
-    ReleaseDC(NULL, hdcScreen);
+    UpdateLayeredWindow(m_hwnd, NULL, &ptDst, &sz, m_hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
 }
 
 LRESULT ToolbarWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+        
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+        
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
         
@@ -540,6 +587,7 @@ LRESULT ToolbarWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         if (newHover != m_hoveredIndex) {
             m_hoveredIndex = newHover;
+            m_contentDirty = true;
             Render();
         }
         return 0;
@@ -548,6 +596,7 @@ LRESULT ToolbarWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     case WM_MOUSELEAVE:
         if (m_hoveredIndex != -1) {
             m_hoveredIndex = -1;
+            m_contentDirty = true;
             Render();
         }
         return 0;

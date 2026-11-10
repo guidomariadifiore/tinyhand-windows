@@ -29,14 +29,15 @@ cl /nologo /O2 /EHsc /std:c++17 /W3 /DUNICODE /D_UNICODE ^
     windows\TrayIcon.cpp ^
     windows\SettingsWindow.cpp ^
     windows\RenderTest.cpp ^
-    gdiplus.lib user32.lib gdi32.lib shell32.lib winmm.lib comctl32.lib ole32.lib shlwapi.lib advapi32.lib ^
+    gdiplus.lib user32.lib gdi32.lib shell32.lib winmm.lib comctl32.lib ole32.lib shlwapi.lib advapi32.lib dwmapi.lib ^
     /Fo:dist\ ^
     /Fe:dist\TinyHand.exe ^
     /link /SUBSYSTEM:CONSOLE
 
+set BUILD_STATUS=%errorlevel%
 del dist\*.obj >nul 2>&1
 
-if %errorlevel% equ 0 (
+if %BUILD_STATUS% equ 0 (
     echo.
     echo ========================================
     echo Build SUCCESS: dist\TinyHand.exe

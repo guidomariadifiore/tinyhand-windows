@@ -20,6 +20,7 @@ using namespace TinyHand;
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    timeBeginPeriod(1);
 
     // 0. Set DPI Awareness (Per-Monitor V2) so virtual metrics match physical pixels
     HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
@@ -172,6 +173,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 
     HandAssetManager::Instance().ClearCache();
     Gdiplus::GdiplusShutdown(gdiplusToken);
+    timeEndPeriod(1);
     return (int)msg.wParam;
 }
 

@@ -4,6 +4,7 @@
 namespace TinyHand {
 
 void InkManager::Begin(double x, double y, double width, Gdiplus::Color color) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     InkStroke stroke;
     stroke.points.push_back({ x, y });
     stroke.width = width;
@@ -15,6 +16,7 @@ void InkManager::Begin(double x, double y, double width, Gdiplus::Color color) {
 }
 
 void InkManager::Extend(double x, double y) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (m_strokes.empty() || m_strokes.back().isEnded) return;
     
     auto& pts = m_strokes.back().points;
@@ -27,6 +29,7 @@ void InkManager::Extend(double x, double y) {
 }
 
 void InkManager::End() {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_strokes.empty() && !m_strokes.back().isEnded) {
         m_strokes.back().isEnded = true;
         m_strokes.back().endTime = GetTickCount64();
@@ -34,18 +37,22 @@ void InkManager::End() {
 }
 
 void InkManager::Clear() {
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_strokes.clear();
 }
 
 bool InkManager::IsDrawing() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
     return !m_strokes.empty() && !m_strokes.back().isEnded;
 }
 
 size_t InkManager::StrokeCount() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
     return m_strokes.size();
 }
 
 void InkManager::Render(Gdiplus::Graphics& g, double fadeDelay, ULONGLONG now) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     const double fadeDuration = 0.6;
     
     // Prune faded strokes
