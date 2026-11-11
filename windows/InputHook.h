@@ -4,8 +4,12 @@
 #include <functional>
 #include <vector>
 #include <mutex>
+#include <atomic>
 
 namespace TinyHand {
+
+static const UINT WM_USER_CURSOR_STATE    = WM_USER + 101;
+static const UINT WM_USER_REINSTALL_HOOKS = WM_USER + 102;
 
 class InputHook {
 public:
@@ -13,6 +17,8 @@ public:
     
     bool Install();
     void Uninstall();
+    bool Reinstall();
+    void CheckAndReinstallWatchdog();
     
     void SetActive(bool active);
     bool IsActive() const { return m_active; }
@@ -22,6 +28,8 @@ public:
     void SetOverlayHwnd(HWND hwnd) { m_overlayHwnd = hwnd; }
     
     bool IsOverInteractiveSystemUI(POINT pt) const;
+    ULONGLONG GetLastHookTime() const { return m_lastHookTime.load(std::memory_order_relaxed); }
+    void RecordHookActivity() { m_lastHookTime.store(GetTickCount64(), std::memory_order_relaxed); }
     
     // Callbacks
     std::function<void(int, int)> onMouseDown;
@@ -50,6 +58,9 @@ private:
     bool m_isInterceptingDown = false;
     bool m_interactHeld = false;
     UINT m_interactVk = VK_MENU; // Default Alt
+    
+    std::atomic<ULONGLONG> m_lastHookTime{ 0 };
+    POINT m_lastWatchdogPt = { -9999, -9999 };
     
     std::vector<RECT> m_passThroughRects;
     mutable std::mutex m_passThroughMutex;

@@ -57,23 +57,10 @@ bool OverlayWindow::Create(HINSTANCE hInstance) {
     SetWindowLongPtrW(m_hwnd, GWLP_USERDATA, (LONG_PTR)this);
     
     // Create double-buffered DIB sections
-    HDC hdcScreen = GetDC(NULL);
-    BITMAPINFO bmi = { sizeof(BITMAPINFOHEADER) };
-    bmi.bmiHeader.biWidth = m_screenW;
-    bmi.bmiHeader.biHeight = -m_screenH;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
+    RecreateBuffers(m_screenW, m_screenH);
     
-    for (int i = 0; i < 2; ++i) {
-        m_hdcMem[i] = CreateCompatibleDC(hdcScreen);
-        m_hBitmap[i] = CreateDIBSection(hdcScreen, &bmi, DIB_RGB_COLORS, &m_bits[i], NULL, 0);
-        m_hOldBitmap[i] = SelectObject(m_hdcMem[i], m_hBitmap[i]);
-    }
-    ReleaseDC(NULL, hdcScreen);
-    
-    m_frontBuffer = 0;
-    m_geometryDirty.store(true, std::memory_order_release);
+    // Watchdog timer (every 500ms)
+    m_watchdogTimerId = SetTimer(m_hwnd, 202, 500, NULL);
     
     // Create Toolbar on UI thread
     m_toolbar.Create(hInstance);
@@ -84,30 +71,21 @@ bool OverlayWindow::Create(HINSTANCE hInstance) {
     m_toolbar.SetInkChoice(m_settings.inkChoice);
     
     m_toolbar.onSelectStyle = [this](PointerStyleId style) {
-        {
-            std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-            m_settings.currentStyle = style;
-            m_needsRedraw.store(true, std::memory_order_relaxed);
-        }
-        m_toolbar.SetCurrentStyle(style);
-        Preferences::Save(m_settings);
-        if (m_hWakeEvent) SetEvent(m_hWakeEvent);
+        Settings s = GetSettings();
+        s.currentStyle = style;
+        ApplySettings(s);
+        Preferences::Save(s);
     };
     
     m_toolbar.onToggleSound = [this]() {
-        bool soundOn = false;
-        {
-            std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-            if (m_settings.currentStyle == PointerStyleId::Laser) {
-                m_settings.laserSound = !m_settings.laserSound;
-                soundOn = m_settings.laserSound;
-            } else {
-                m_settings.soundEnabled = !m_settings.soundEnabled;
-                soundOn = m_settings.soundEnabled;
-            }
+        Settings s = GetSettings();
+        if (s.currentStyle == PointerStyleId::Laser) {
+            s.laserSound = !s.laserSound;
+        } else {
+            s.soundEnabled = !s.soundEnabled;
         }
-        m_toolbar.SetSoundEnabled(soundOn);
-        Preferences::Save(m_settings);
+        ApplySettings(s);
+        Preferences::Save(s);
     };
     
     m_toolbar.onExit = [this]() {
@@ -115,12 +93,10 @@ bool OverlayWindow::Create(HINSTANCE hInstance) {
     };
     
     m_toolbar.onSelectInk = [this](InkChoiceId choice) {
-        {
-            std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-            m_settings.inkChoice = choice;
-        }
-        m_toolbar.SetInkChoice(choice);
-        Preferences::Save(m_settings);
+        Settings s = GetSettings();
+        s.inkChoice = choice;
+        ApplySettings(s);
+        Preferences::Save(s);
     };
     
     // Connect input hook callbacks
@@ -136,11 +112,17 @@ bool OverlayWindow::Create(HINSTANCE hInstance) {
 }
 
 void OverlayWindow::Destroy() {
+    if (m_watchdogTimerId) {
+        KillTimer(m_hwnd, m_watchdogTimerId);
+        m_watchdogTimerId = 0;
+    }
     Deactivate();
     m_toolbar.Destroy();
     
+    std::lock_guard<std::recursive_mutex> pLock(m_presentMutex);
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     for (int i = 0; i < 2; ++i) {
+        m_graphics[i].reset();
         if (m_hdcMem[i]) {
             SelectObject(m_hdcMem[i], m_hOldBitmap[i]);
             DeleteDC(m_hdcMem[i]);
@@ -158,32 +140,97 @@ void OverlayWindow::Destroy() {
     }
 }
 
+void OverlayWindow::WakeRenderThread() {
+    HANDLE hWake = m_hWakeEvent.load(std::memory_order_relaxed);
+    if (hWake) {
+        SetEvent(hWake);
+    }
+}
+
 void OverlayWindow::StartRenderThread() {
-    if (m_renderThread) return;
-    m_renderThreadRunning.store(true, std::memory_order_relaxed);
-    m_hWakeEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    std::lock_guard<std::mutex> lock(m_threadLifecycleMutex);
+    if (m_renderThread) {
+        DWORD code = 0;
+        if (GetExitCodeThread(m_renderThread, &code) && code == STILL_ACTIVE) {
+            return;
+        }
+        CloseHandle(m_renderThread);
+        m_renderThread = NULL;
+    }
+    m_renderThreadRunning.store(true, std::memory_order_release);
+    if (!m_hWakeEvent.load(std::memory_order_relaxed)) {
+        m_hWakeEvent.store(CreateEventW(NULL, FALSE, FALSE, NULL), std::memory_order_release);
+    }
     m_renderThread = CreateThread(NULL, 0, [](LPVOID param) -> DWORD {
         OverlayWindow* self = (OverlayWindow*)param;
         self->RenderThreadProc();
         return 0;
     }, this, 0, NULL);
     if (m_renderThread) {
-        SetThreadPriority(m_renderThread, THREAD_PRIORITY_TIME_CRITICAL);
+        SetThreadPriority(m_renderThread, THREAD_PRIORITY_ABOVE_NORMAL);
     }
 }
 
+void OverlayWindow::RecreateBuffers(int newW, int newH) {
+    if (newW <= 0) newW = 1920;
+    if (newH <= 0) newH = 1080;
+    
+    std::lock_guard<std::recursive_mutex> pLock(m_presentMutex);
+    std::lock_guard<std::recursive_mutex> sLock(m_stateMutex);
+    
+    m_screenX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    m_screenY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    m_screenW = newW;
+    m_screenH = newH;
+    
+    HDC hdcScreen = GetDC(NULL);
+    BITMAPINFO bmi = { sizeof(BITMAPINFOHEADER) };
+    bmi.bmiHeader.biWidth = m_screenW;
+    bmi.bmiHeader.biHeight = -m_screenH;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    
+    for (int i = 0; i < 2; ++i) {
+        m_graphics[i].reset();
+        if (m_hdcMem[i]) {
+            if (m_hOldBitmap[i]) SelectObject(m_hdcMem[i], m_hOldBitmap[i]);
+            if (m_hBitmap[i]) DeleteObject(m_hBitmap[i]);
+            DeleteDC(m_hdcMem[i]);
+            m_hdcMem[i] = NULL;
+            m_hBitmap[i] = NULL;
+            m_hOldBitmap[i] = NULL;
+            m_bits[i] = NULL;
+        }
+        
+        m_hdcMem[i] = CreateCompatibleDC(hdcScreen);
+        m_hBitmap[i] = CreateDIBSection(hdcScreen, &bmi, DIB_RGB_COLORS, &m_bits[i], NULL, 0);
+        m_hOldBitmap[i] = SelectObject(m_hdcMem[i], m_hBitmap[i]);
+        m_graphics[i] = std::make_unique<Gdiplus::Graphics>(m_hdcMem[i]);
+        m_graphics[i]->SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        m_graphics[i]->SetInterpolationMode(Gdiplus::InterpolationModeBilinear);
+        m_graphics[i]->SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    }
+    ReleaseDC(NULL, hdcScreen);
+    
+    m_frontBuffer = 0;
+    m_geometryDirty.store(true, std::memory_order_release);
+    m_needsRedraw.store(true, std::memory_order_relaxed);
+}
+
 void OverlayWindow::StopRenderThread() {
+    std::lock_guard<std::mutex> lock(m_threadLifecycleMutex);
     if (!m_renderThread) return;
-    m_renderThreadRunning.store(false, std::memory_order_relaxed);
-    if (m_hWakeEvent) {
-        SetEvent(m_hWakeEvent);
+    m_renderThreadRunning.store(false, std::memory_order_release);
+    HANDLE hWake = m_hWakeEvent.exchange(NULL, std::memory_order_acq_rel);
+    if (hWake) {
+        SetEvent(hWake);
     }
     WaitForSingleObject(m_renderThread, 2000);
     CloseHandle(m_renderThread);
     m_renderThread = NULL;
-    if (m_hWakeEvent) {
-        CloseHandle(m_hWakeEvent);
-        m_hWakeEvent = NULL;
+    if (hWake) {
+        CloseHandle(hWake);
     }
 }
 
@@ -254,80 +301,101 @@ void OverlayWindow::RenderThreadProc() {
     LARGE_INTEGER qpcFreq;
     QueryPerformanceFrequency(&qpcFreq);
     
+    POINT lastPolledPt = { -9999, -9999 };
+    
     while (m_renderThreadRunning.load(std::memory_order_relaxed)) {
-        if (!m_isActive.load(std::memory_order_relaxed)) {
-            WaitForSingleObject(m_hWakeEvent, 50);
-            continue;
-        }
-        
-        // 1. Directly query actual OS cursor position in real-time
-        POINT curPt;
-        if (GetCursorPos(&curPt)) {
-            double prevX = m_cursorX.load(std::memory_order_relaxed);
-            double prevY = m_cursorY.load(std::memory_order_relaxed);
-            if (std::abs(curPt.x - prevX) >= 0.5 || std::abs(curPt.y - prevY) >= 0.5) {
-                m_cursorX.store((double)curPt.x, std::memory_order_relaxed);
-                m_cursorY.store((double)curPt.y, std::memory_order_relaxed);
-                m_lastMoveTime.store(GetTickCount64(), std::memory_order_relaxed);
-                m_needsRedraw.store(true, std::memory_order_relaxed);
-                
-                if (m_held.load(std::memory_order_relaxed)) {
-                    ExtendInkIfDrawing(curPt.x, curPt.y);
-                }
-            }
-        }
-        
-        bool needRender = false;
-        {
-            std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-            ULONGLONG now = GetTickCount64();
-            bool isMoving = (now - m_lastMoveTime.load(std::memory_order_relaxed)) < 150;
-            bool isAnimating = m_arm.IsSettling() || m_ink.IsDrawing() || 
-                               (m_settings.fadeSeconds > 0 && m_ink.StrokeCount() > 0) ||
-                               m_held.load(std::memory_order_relaxed) ||
-                               m_needsRedraw.load(std::memory_order_relaxed);
-            needRender = isMoving || isAnimating;
-        }
-        
-        if (needRender) {
-            LARGE_INTEGER frameStart;
-            QueryPerformanceCounter(&frameStart);
+        try {
+            m_lastRenderTick.store(GetTickCount64(), std::memory_order_relaxed);
             
-            int backIdx = 0;
-            bool hasFrame = false;
-            {
-                std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-                hasFrame = RenderFrame(backIdx);
+            if (!m_isActive.load(std::memory_order_relaxed)) {
+                HANDLE hWake = m_hWakeEvent.load(std::memory_order_relaxed);
+                if (hWake) WaitForSingleObject(hWake, 50);
+                else Sleep(50);
+                continue;
             }
             
-            // Present frame to DWM outside m_stateMutex
-            if (hasFrame) {
-                PresentFrame(backIdx);
-            }
-            
-            int curFps = m_displayRefreshRate.load(std::memory_order_relaxed);
-            if (curFps < 30) curFps = 144;
-            double targetFrameMs = 1000.0 / curFps;
-            
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
-            double elapsedMs = (double)(now.QuadPart - frameStart.QuadPart) * 1000.0 / qpcFreq.QuadPart;
-            if (elapsedMs < targetFrameMs) {
-                DWORD sleepMs = (DWORD)(targetFrameMs - elapsedMs);
-                if (sleepMs > 1) {
-                    Sleep(sleepMs - 1);
-                }
-                while (true) {
-                    QueryPerformanceCounter(&now);
-                    if ((double)(now.QuadPart - frameStart.QuadPart) * 1000.0 / qpcFreq.QuadPart >= targetFrameMs) {
-                        break;
+            // 1. Directly query actual OS cursor position in real-time
+            POINT curPt;
+            if (GetCursorPos(&curPt)) {
+                if (curPt.x != lastPolledPt.x || curPt.y != lastPolledPt.y) {
+                    lastPolledPt = curPt;
+                    m_cursorX.store((double)curPt.x, std::memory_order_relaxed);
+                    m_cursorY.store((double)curPt.y, std::memory_order_relaxed);
+                    m_lastMoveTime.store(GetTickCount64(), std::memory_order_relaxed);
+                    m_needsRedraw.store(true, std::memory_order_relaxed);
+                    
+                    if (m_held.load(std::memory_order_relaxed)) {
+                        ExtendInkIfDrawing(curPt.x, curPt.y);
+                    }
+                    
+                    m_toolbar.NotifyCursorPos((double)curPt.x, (double)curPt.y);
+                    InputHook::Instance().CheckAndReinstallWatchdog();
+                    
+                    // Automatically switch to normal cursor if over Taskbar, system tray, menus
+                    bool overSys = InputHook::Instance().IsOverInteractiveSystemUI(curPt);
+                    bool shouldBeNormal = m_interactHeld.load(std::memory_order_relaxed) || overSys;
+                    bool prevNormal = m_normalCursor.load(std::memory_order_relaxed);
+                    if (shouldBeNormal != prevNormal) {
+                        m_normalCursor.store(shouldBeNormal, std::memory_order_relaxed);
+                        m_needsRedraw.store(true, std::memory_order_relaxed);
+                        if (m_hwnd) {
+                            PostMessageW(m_hwnd, WM_USER_CURSOR_STATE, shouldBeNormal ? 1 : 0, 0);
+                        }
                     }
                 }
             }
-        } else {
-            // Polling interval of 4ms ensures ultra-smooth responsiveness (250Hz OS cursor polling)
-            // and instantaneous wakeup when input hook fires (<0.05ms)
-            WaitForSingleObject(m_hWakeEvent, 4);
+            
+            bool needRender = false;
+            {
+                std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+                ULONGLONG now = GetTickCount64();
+                bool isMoving = (now - m_lastMoveTime.load(std::memory_order_relaxed)) < 150;
+                bool isAnimating = m_arm.IsSettling() || m_ink.IsDrawing() || 
+                                   (m_settings.fadeSeconds > 0 && m_ink.StrokeCount() > 0) ||
+                                   m_held.load(std::memory_order_relaxed) ||
+                                   m_needsRedraw.load(std::memory_order_relaxed);
+                needRender = isMoving || isAnimating;
+            }
+            
+            if (needRender) {
+                LARGE_INTEGER frameStart;
+                QueryPerformanceCounter(&frameStart);
+                
+                int backIdx = 0;
+                bool hasFrame = false;
+                {
+                    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+                    hasFrame = RenderFrame(backIdx);
+                }
+                
+                // Present frame to DWM outside m_stateMutex
+                if (hasFrame) {
+                    PresentFrame(backIdx);
+                }
+                
+                int curFps = m_displayRefreshRate.load(std::memory_order_relaxed);
+                if (curFps < 30) curFps = 144;
+                double targetFrameMs = 1000.0 / curFps;
+                
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                double elapsedMs = (double)(now.QuadPart - frameStart.QuadPart) * 1000.0 / qpcFreq.QuadPart;
+                if (elapsedMs < targetFrameMs) {
+                    DWORD sleepMs = (DWORD)(targetFrameMs - elapsedMs);
+                    if (sleepMs > 0) {
+                        Sleep(sleepMs);
+                    }
+                }
+            } else {
+                // Polling interval of 4ms ensures ultra-smooth responsiveness (250Hz OS cursor polling)
+                // and instantaneous wakeup when input hook fires (<0.05ms)
+                HANDLE hWake = m_hWakeEvent.load(std::memory_order_relaxed);
+                if (hWake) WaitForSingleObject(hWake, 4);
+                else Sleep(4);
+            }
+        } catch (...) {
+            // Defensive recovery against unexpected faults
+            Sleep(5);
         }
     }
     
@@ -343,9 +411,15 @@ void OverlayWindow::ApplySettings(const Settings& s) {
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
         m_settings = s;
-        m_needsRedraw.store(true, std::memory_order_relaxed);
+        m_needsRedraw.store(true, std::memory_order_release);
+        m_geometryDirty.store(true, std::memory_order_release);
     }
-    if (m_hWakeEvent) SetEvent(m_hWakeEvent);
+    WakeRenderThread();
+    
+    // Force immediate presentation tick even if render thread was idle or sleeping
+    if (m_isActive.load(std::memory_order_relaxed)) {
+        TickAndRender();
+    }
 }
 
 bool OverlayWindow::Activate() {
@@ -392,7 +466,7 @@ bool OverlayWindow::Activate() {
     
     // Presentation loop is driven by RenderThreadProc at 144Hz VSync without 16ms timer judder
     StartRenderThread();
-    if (m_hWakeEvent) SetEvent(m_hWakeEvent);
+    WakeRenderThread();
     
     if (onActiveChanged) onActiveChanged(true);
     return true;
@@ -442,7 +516,7 @@ void OverlayWindow::ClearInk() {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
         m_needsRedraw.store(true, std::memory_order_relaxed);
     }
-    if (m_hWakeEvent) SetEvent(m_hWakeEvent);
+    WakeRenderThread();
 }
 
 void OverlayWindow::HandleMouseDown(int x, int y) {
@@ -467,7 +541,7 @@ void OverlayWindow::HandleMouseDown(int x, int y) {
     }
     
     m_toolbar.SetDrawing(true);
-    if (m_hWakeEvent) SetEvent(m_hWakeEvent);
+    WakeRenderThread();
 }
 
 void OverlayWindow::HandleMouseUp(int x, int y) {
@@ -479,7 +553,7 @@ void OverlayWindow::HandleMouseUp(int x, int y) {
         m_needsRedraw.store(true, std::memory_order_relaxed);
     }
     m_toolbar.SetDrawing(false);
-    if (m_hWakeEvent) SetEvent(m_hWakeEvent);
+    WakeRenderThread();
 }
 
 void OverlayWindow::HandleMouseMove(int x, int y) {
@@ -493,34 +567,13 @@ void OverlayWindow::HandleMouseMove(int x, int y) {
     }
     
     m_toolbar.NotifyCursorPos((double)x, (double)y);
-    
-    // Automatically switch to normal cursor if over Taskbar, system tray, menus, or interactive toolbar
-    POINT pt = { x, y };
-    bool overSystemUI = InputHook::Instance().IsOverInteractiveSystemUI(pt);
-    bool overToolbar = m_toolbar.IsOverInteractive((double)x, (double)y);
-    bool shouldBeNormal = m_interactHeld.load(std::memory_order_relaxed) || overSystemUI || overToolbar;
-    bool prevNormal = m_normalCursor.load(std::memory_order_relaxed);
-    if (shouldBeNormal != prevNormal) {
-        m_normalCursor.store(shouldBeNormal, std::memory_order_relaxed);
-        if (shouldBeNormal) {
-            CursorManager::Instance().Show();
-        } else {
-            if (m_isActive.load(std::memory_order_relaxed)) CursorManager::Instance().Hide();
-        }
-        m_needsRedraw.store(true, std::memory_order_relaxed);
-    }
-    
-    if (m_hWakeEvent) {
-        SetEvent(m_hWakeEvent);
-    }
+    WakeRenderThread();
 }
 
 void OverlayWindow::HandleInteract(bool held) {
     m_interactHeld.store(held, std::memory_order_relaxed);
     POINT pt = { (LONG)m_cursorX.load(), (LONG)m_cursorY.load() };
-    bool shouldBeNormal = held ||
-                          InputHook::Instance().IsOverInteractiveSystemUI(pt) ||
-                          m_toolbar.IsOverInteractive(pt.x, pt.y);
+    bool shouldBeNormal = held || InputHook::Instance().IsOverInteractiveSystemUI(pt);
     bool prevNormal = m_normalCursor.load(std::memory_order_relaxed);
     if (shouldBeNormal != prevNormal) {
         m_normalCursor.store(shouldBeNormal, std::memory_order_relaxed);
@@ -531,7 +584,7 @@ void OverlayWindow::HandleInteract(bool held) {
         }
     }
     m_needsRedraw.store(true, std::memory_order_relaxed);
-    if (m_hWakeEvent) SetEvent(m_hWakeEvent);
+    WakeRenderThread();
 }
 
 bool OverlayWindow::RenderFrame(int& outBackIdx) {
@@ -555,20 +608,29 @@ bool OverlayWindow::RenderFrame(int& outBackIdx) {
     
     // 3. Render content into memory DC
     {
-        Gdiplus::Graphics g(m_hdcMem[backIdx]);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
-        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-        
-        // 1. Draw Ink (points recorded in screen coordinates, translated to window surface)
-        g.TranslateTransform((float)-m_screenX, (float)-m_screenY);
-        m_ink.Render(g, m_settings.fadeSeconds, now);
-        g.ResetTransform();
-        
-        // 2. Draw Arm or Laser (if not in interact/normal cursor mode)
-        if (!m_normalCursor.load(std::memory_order_relaxed)) {
-            m_arm.RenderArm(g, m_settings.currentStyle, localCursorX, localCursorY,
-                            m_screenW, m_screenH, m_settings.showShadow, m_settings.pointerSize);
+        Gdiplus::Graphics* g = m_graphics[backIdx].get();
+        if (g) {
+            if (g->GetLastStatus() != Gdiplus::Ok) {
+                m_graphics[backIdx] = std::make_unique<Gdiplus::Graphics>(m_hdcMem[backIdx]);
+                m_graphics[backIdx]->SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                m_graphics[backIdx]->SetInterpolationMode(Gdiplus::InterpolationModeBilinear);
+                m_graphics[backIdx]->SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+                g = m_graphics[backIdx].get();
+            }
+            
+            // 1. Draw Ink (points recorded in screen coordinates, translated to window surface)
+            if (m_ink.StrokeCount() > 0) {
+                g->TranslateTransform((float)-m_screenX, (float)-m_screenY);
+                m_ink.Render(*g, m_settings.fadeSeconds, now);
+                g->ResetTransform();
+            }
+            
+            // 2. Draw Arm or Laser (if not in interact/normal cursor mode)
+            if (!m_normalCursor.load(std::memory_order_relaxed)) {
+                m_arm.RenderArm(*g, m_settings.currentStyle, localCursorX, localCursorY,
+                                m_screenW, m_screenH, m_settings.showShadow, m_settings.pointerSize);
+            }
+            g->Flush(Gdiplus::FlushIntentionSync);
         }
     }
     
@@ -581,6 +643,8 @@ bool OverlayWindow::RenderFrame(int& outBackIdx) {
 void OverlayWindow::PresentFrame(int backIdx) {
     if (!m_hwnd || !m_bits[backIdx] || !m_hdcMem[backIdx]) return;
     
+    std::lock_guard<std::recursive_mutex> pLock(m_presentMutex);
+    
     POINT ptDst = { m_screenX, m_screenY };
     SIZE sz = { m_screenW, m_screenH };
     POINT ptSrc = { 0, 0 };
@@ -591,11 +655,24 @@ void OverlayWindow::PresentFrame(int backIdx) {
     blend.SourceConstantAlpha = 255;
     blend.AlphaFormat = AC_SRC_ALPHA;
     
-    m_geometryDirty.store(false, std::memory_order_release);
-    
-    UpdateLayeredWindow(m_hwnd, NULL, &ptDst,
-                        &sz,
-                        m_hdcMem[backIdx], &ptSrc, 0, &blend, ULW_ALPHA);
+    BOOL ok = UpdateLayeredWindow(m_hwnd, NULL, &ptDst,
+                                  &sz,
+                                  m_hdcMem[backIdx], &ptSrc, 0, &blend, ULW_ALPHA);
+    if (!ok) {
+        DWORD err = GetLastError();
+        m_geometryDirty.store(true, std::memory_order_release);
+        
+        LONG_PTR exStyle = GetWindowLongPtrW(m_hwnd, GWL_EXSTYLE);
+        if (!(exStyle & WS_EX_LAYERED)) {
+            SetWindowLongPtrW(m_hwnd, GWL_EXSTYLE, exStyle | WS_EX_LAYERED);
+        }
+        
+        if (err == ERROR_INVALID_HANDLE || err == ERROR_DC_NOT_FOUND || err == ERROR_INVALID_PARAMETER) {
+            RecreateBuffers(m_screenW, m_screenH);
+        }
+    } else {
+        m_geometryDirty.store(false, std::memory_order_release);
+    }
 }
 
 void OverlayWindow::TickAndRender() {
@@ -613,7 +690,53 @@ void OverlayWindow::TickAndRender() {
 LRESULT OverlayWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_TIMER: {
-        TickAndRender();
+        if (wParam == 202) {
+            // Watchdog tick (500ms)
+            if (m_isActive.load(std::memory_order_relaxed)) {
+                InputHook::Instance().CheckAndReinstallWatchdog();
+                
+                DWORD exitCode = 0;
+                if (m_renderThread && GetExitCodeThread(m_renderThread, &exitCode)) {
+                    if (exitCode != STILL_ACTIVE) {
+                        StartRenderThread();
+                    }
+                }
+                
+                ULONGLONG lastTick = m_lastRenderTick.load(std::memory_order_relaxed);
+                ULONGLONG now = GetTickCount64();
+                if (lastTick > 0 && (now - lastTick) > 1000) {
+                    WakeRenderThread();
+                }
+                if (lastTick > 0 && (now - lastTick) > 2000) {
+                    TickAndRender();
+                }
+                if (lastTick > 0 && (now - lastTick) > 3500) {
+                    StopRenderThread();
+                    StartRenderThread();
+                    m_lastRenderTick.store(now, std::memory_order_relaxed);
+                }
+            }
+            return 0;
+        } else {
+            TickAndRender();
+            return 0;
+        }
+    }
+    
+    case WM_USER_CURSOR_STATE: {
+        bool shouldBeNormal = (wParam != 0);
+        if (shouldBeNormal) {
+            CursorManager::Instance().Show();
+        } else {
+            if (m_isActive.load(std::memory_order_relaxed)) {
+                CursorManager::Instance().Hide();
+            }
+        }
+        return 0;
+    }
+    
+    case WM_USER_REINSTALL_HOOKS: {
+        InputHook::Instance().Reinstall();
         return 0;
     }
         
@@ -647,33 +770,8 @@ LRESULT OverlayWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         m_screenX = newX;
         m_screenY = newY;
         
-        if (newW != m_screenW || newH != m_screenH) {
-            m_screenW = newW;
-            m_screenH = newH;
-            
-            // Recreate double-buffered DIB sections with new dimensions
-            HDC hdcScreen = GetDC(NULL);
-            for (int i = 0; i < 2; ++i) {
-                if (m_hdcMem[i]) {
-                    SelectObject(m_hdcMem[i], m_hOldBitmap[i]);
-                    if (m_hBitmap[i]) DeleteObject(m_hBitmap[i]);
-                    
-                    BITMAPINFO bmi = { sizeof(BITMAPINFOHEADER) };
-                    bmi.bmiHeader.biWidth = m_screenW;
-                    bmi.bmiHeader.biHeight = -m_screenH;
-                    bmi.bmiHeader.biPlanes = 1;
-                    bmi.bmiHeader.biBitCount = 32;
-                    bmi.bmiHeader.biCompression = BI_RGB;
-                    
-                    m_hBitmap[i] = CreateDIBSection(hdcScreen, &bmi, DIB_RGB_COLORS, &m_bits[i], NULL, 0);
-                    m_hOldBitmap[i] = SelectObject(m_hdcMem[i], m_hBitmap[i]);
-                }
-            }
-            ReleaseDC(NULL, hdcScreen);
-            m_frontBuffer = 0;
-        }
+        RecreateBuffers(newW, newH);
         
-        m_geometryDirty.store(true, std::memory_order_release);
         if (m_hwnd) {
             SetWindowPos(m_hwnd, HWND_TOPMOST, m_screenX, m_screenY, m_screenW, m_screenH,
                          SWP_NOACTIVATE);
@@ -684,7 +782,7 @@ LRESULT OverlayWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         
         if (m_isActive.load(std::memory_order_relaxed)) {
             StartRenderThread();
-            if (m_hWakeEvent) SetEvent(m_hWakeEvent);
+            WakeRenderThread();
         }
         return 0;
     }

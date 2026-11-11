@@ -90,7 +90,8 @@ enum class TapSoundChoiceId {
     Pop,
     Wood,
     Boop,
-    Squeak
+    Squeak,
+    Clang
 };
 
 struct TapSoundInfo {

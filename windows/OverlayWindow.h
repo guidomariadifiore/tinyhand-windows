@@ -8,6 +8,7 @@
 #include <functional>
 #include <mutex>
 #include <atomic>
+#include <memory>
 
 #pragma comment(lib, "dwmapi.lib")
 
@@ -37,6 +38,11 @@ public:
     void ApplySettings(const Settings& s);
     const Settings& GetSettings() const { return m_settings; }
     
+    void StartRenderThread();
+    void StopRenderThread();
+    void WakeRenderThread();
+    void RecreateBuffers(int newW, int newH);
+    
     // Callbacks
     std::function<void(bool)> onActiveChanged;
     std::function<void()> onOpenSettings;
@@ -47,8 +53,6 @@ private:
     bool RenderFrame(int& outBackIdx);
     void PresentFrame(int backIdx);
     void TickAndRender();
-    void StartRenderThread();
-    void StopRenderThread();
     void RenderThreadProc();
     int DetectRefreshRate();
     void ExtendInkIfDrawing(double x, double y);
@@ -61,10 +65,14 @@ private:
     HWND m_hwnd = NULL;
     HINSTANCE m_hInstance = NULL;
     UINT_PTR m_timerId = 0;
+    UINT_PTR m_watchdogTimerId = 0;
     
     HANDLE m_renderThread = NULL;
-    HANDLE m_hWakeEvent = NULL;
+    std::atomic<HANDLE> m_hWakeEvent{ NULL };
     std::atomic<bool> m_renderThreadRunning{ false };
+    std::atomic<ULONGLONG> m_lastRenderTick{ 0 };
+    std::mutex m_threadLifecycleMutex;
+    std::recursive_mutex m_presentMutex;
     
     std::recursive_mutex m_stateMutex;
     std::atomic<bool> m_needsRedraw{ false };
@@ -99,6 +107,7 @@ private:
     HBITMAP m_hBitmap[2] = { NULL, NULL };
     HGDIOBJ m_hOldBitmap[2] = { NULL, NULL };
     void* m_bits[2] = { NULL, NULL };
+    std::unique_ptr<Gdiplus::Graphics> m_graphics[2];
     int m_frontBuffer = 0;
 };
 

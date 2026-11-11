@@ -2,7 +2,7 @@ import AppKit
 import AVFoundation
 
 enum TapSoundChoice: String, CaseIterable {
-    case thock, click, pop, wood, boop, squeak
+    case thock, click, pop, wood, boop, squeak, clang
 
     var title: String {
         switch self {
@@ -12,6 +12,7 @@ enum TapSoundChoice: String, CaseIterable {
         case .wood: return "Wood block"
         case .boop: return "Boop"
         case .squeak: return "Squeak"
+        case .clang: return "Clang"
         }
     }
 }

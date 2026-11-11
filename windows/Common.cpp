@@ -92,7 +92,8 @@ static const std::vector<TapSoundInfo> g_tapSounds = {
     { TapSoundChoiceId::Pop, L"pop", L"Pop" },
     { TapSoundChoiceId::Wood, L"wood", L"Wood block" },
     { TapSoundChoiceId::Boop, L"boop", L"Boop" },
-    { TapSoundChoiceId::Squeak, L"squeak", L"Squeak" }
+    { TapSoundChoiceId::Squeak, L"squeak", L"Squeak" },
+    { TapSoundChoiceId::Clang, L"clang", L"Clang" }
 };
 
 const std::vector<TapSoundInfo>& GetAllTapSounds() {

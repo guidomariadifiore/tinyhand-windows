@@ -21,6 +21,7 @@ bool InputHook::Install() {
     if (!m_hKeyboardHook) {
         m_hKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(NULL), 0);
     }
+    m_lastHookTime.store(GetTickCount64(), std::memory_order_relaxed);
     return (m_hMouseHook != NULL && m_hKeyboardHook != NULL);
 }
 
@@ -35,6 +36,57 @@ void InputHook::Uninstall() {
     }
     m_active = false;
     m_isInterceptingDown = false;
+}
+
+bool InputHook::Reinstall() {
+    if (!m_active) return false;
+    
+    if (m_hMouseHook) {
+        UnhookWindowsHookEx(m_hMouseHook);
+        m_hMouseHook = NULL;
+    }
+    if (m_hKeyboardHook) {
+        UnhookWindowsHookEx(m_hKeyboardHook);
+        m_hKeyboardHook = NULL;
+    }
+    m_hMouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, GetModuleHandle(NULL), 0);
+    m_hKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(NULL), 0);
+    m_lastHookTime.store(GetTickCount64(), std::memory_order_relaxed);
+    return (m_hMouseHook != NULL && m_hKeyboardHook != NULL);
+}
+
+void InputHook::CheckAndReinstallWatchdog() {
+    if (!m_active) return;
+    
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG last = m_lastHookTime.load(std::memory_order_relaxed);
+    
+    // If hooks are null while active, reinstall
+    if (!m_hMouseHook || !m_hKeyboardHook) {
+        if (m_overlayHwnd) {
+            PostMessageW(m_overlayHwnd, WM_USER_REINSTALL_HOOKS, 0, 0);
+        } else {
+            Reinstall();
+        }
+        return;
+    }
+    
+    // Check if mouse moved but hook hasn't fired in > 300ms
+    POINT pt;
+    if (GetCursorPos(&pt)) {
+        if (std::abs(pt.x - m_lastWatchdogPt.x) > 3 || std::abs(pt.y - m_lastWatchdogPt.y) > 3) {
+            m_lastWatchdogPt = pt;
+            if (last == 0) {
+                m_lastHookTime.store(now, std::memory_order_relaxed);
+            } else if ((now - last) > 300) {
+                if (m_overlayHwnd) {
+                    PostMessageW(m_overlayHwnd, WM_USER_REINSTALL_HOOKS, 0, 0);
+                } else {
+                    Reinstall();
+                }
+            }
+        }
+    }
 }
 
 void InputHook::SetActive(bool active) {
@@ -127,6 +179,7 @@ LRESULT InputHook::HandleMouse(int nCode, WPARAM wParam, LPARAM lParam) {
     }
     
     MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lParam;
+    m_lastHookTime.store(GetTickCount64(), std::memory_order_relaxed);
     
     // Always notify mouse move and return immediately to keep hook processing ultra-fast (<0.01ms)
     if (wParam == WM_MOUSEMOVE) {
@@ -182,6 +235,7 @@ LRESULT InputHook::HandleMouse(int nCode, WPARAM wParam, LPARAM lParam) {
 
 LRESULT InputHook::HandleKeyboard(int nCode, WPARAM wParam, LPARAM lParam) {
     KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
+    m_lastHookTime.store(GetTickCount64(), std::memory_order_relaxed);
     
     if (m_active) {
         // Escape key to dismiss TinyHand

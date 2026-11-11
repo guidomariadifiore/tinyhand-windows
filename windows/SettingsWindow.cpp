@@ -146,8 +146,8 @@ void SettingsWindow::InitControls() {
     
     // 7. Tap Sound Choice + Test Button
     createLabel(L"Sound Effect:", curY);
-    m_comboTapSound = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-                                    ctrlX, curY, 160, 150, m_hwnd, (HMENU)IDC_COMBO_TAP_SOUND, m_hInstance, NULL);
+    m_comboTapSound = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                                    ctrlX, curY, 160, 200, m_hwnd, (HMENU)IDC_COMBO_TAP_SOUND, m_hInstance, NULL);
     SendMessageW(m_comboTapSound, WM_SETFONT, (WPARAM)hFont, TRUE);
     for (const auto& ts : GetAllTapSounds()) {
         SendMessageW(m_comboTapSound, CB_ADDSTRING, 0, (LPARAM)ts.title);
@@ -208,12 +208,14 @@ void SettingsWindow::LoadSettingsIntoUI(const Settings& s) {
     SendMessageW(m_chkSound, BM_SETCHECK, s.soundEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     
     const auto& sounds = GetAllTapSounds();
+    int selSoundIdx = 0;
     for (size_t i = 0; i < sounds.size(); ++i) {
         if (sounds[i].id == s.tapSound) {
-            SendMessageW(m_comboTapSound, CB_SETCURSEL, (WPARAM)i, 0);
+            selSoundIdx = (int)i;
             break;
         }
     }
+    SendMessageW(m_comboTapSound, CB_SETCURSEL, (WPARAM)selSoundIdx, 0);
     
     SendMessageW(m_chkLaunchAtStartup, BM_SETCHECK, s.launchAtLogin ? BST_CHECKED : BST_UNCHECKED, 0);
 }

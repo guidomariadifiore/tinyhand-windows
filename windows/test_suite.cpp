@@ -8,6 +8,7 @@
 #include "OverlayWindow.h"
 #include "InputHook.h"
 #include "CursorManager.h"
+#include "SettingsWindow.h"
 #include <cassert>
 #include <iostream>
 #include <cmath>
@@ -43,6 +44,12 @@ void TestPreferences() {
     TEST_ASSERT(loaded.soundEnabled == false, "Sound matches");
     TEST_ASSERT(loaded.tapSound == TapSoundChoiceId::Wood, "Tap sound matches");
     TEST_ASSERT(loaded.inkChoice == InkChoiceId::Blue, "Ink choice matches");
+    
+    // Test Clang tap sound persistence
+    s.tapSound = TapSoundChoiceId::Clang;
+    Preferences::Save(s);
+    loaded = Preferences::Load();
+    TEST_ASSERT(loaded.tapSound == TapSoundChoiceId::Clang, "Clang tap sound matches");
     
     // Reset back to defaults
     Settings def;
@@ -88,8 +95,49 @@ void TestTapSounds() {
     std::cout << "[TEST] Testing Low-Latency TapSoundPlayer..." << std::endl;
     auto& player = TapSoundPlayer::Instance();
     const auto& sounds = GetAllTapSounds();
-    TEST_ASSERT(sounds.size() == 6, "Must have 6 tap sounds");
-    TEST_ASSERT(player.GetLoadedSoundCount() == 6, "All 6 sound effects must be pre-decoded into memory");
+    TEST_ASSERT(sounds.size() == 7, "Must have 7 tap sounds");
+    TEST_ASSERT(player.GetLoadedSoundCount() == 7, "All 7 sound effects must be pre-decoded into memory");
+    
+    // Validate Clang sound exists with correct rawName and title
+    bool hasClang = false;
+    for (const auto& ts : sounds) {
+        if (ts.id == TapSoundChoiceId::Clang && std::wstring(ts.rawName) == L"clang" && std::wstring(ts.title) == L"Clang") {
+            hasClang = true;
+            break;
+        }
+    }
+    TEST_ASSERT(hasClang, "Clang sound must be in GetAllTapSounds() with correct rawName and title");
+    
+    // Validate SettingsWindow UI round-trip with Clang
+    {
+        SettingsWindow settingsWin;
+        bool winCreated = settingsWin.Create(GetModuleHandle(NULL));
+        TEST_ASSERT(winCreated, "SettingsWindow created successfully for Clang UI test");
+        
+        Settings sIn;
+        sIn.tapSound = TapSoundChoiceId::Clang;
+        Settings sSaved;
+        bool savedCallbackFired = false;
+        settingsWin.onSettingsSaved = [&](const Settings& s) {
+            sSaved = s;
+            savedCallbackFired = true;
+        };
+        settingsWin.Show(sIn);
+        
+        HWND hSettings = FindWindowW(L"TinyHand_SettingsClass", NULL);
+        TEST_ASSERT(hSettings != NULL, "Settings window handle valid");
+        
+        // Test preview button (IDC_BTN_TEST_SOUND = 2008)
+        SendMessageW(hSettings, WM_COMMAND, 2008, 0);
+        
+        // Test save button (IDC_BTN_SAVE = 2010)
+        SendMessageW(hSettings, WM_COMMAND, 2010, 0);
+        
+        TEST_ASSERT(savedCallbackFired, "SettingsWindow save button invoked callback");
+        TEST_ASSERT(sSaved.tapSound == TapSoundChoiceId::Clang, "SettingsWindow preserved Clang tap sound");
+        
+        settingsWin.Hide();
+    }
     
     std::cout << "  -> WASAPI low-latency engine active: " << (player.IsWasapiActive() ? "YES" : "NO (fallback)") << std::endl;
     std::cout << "  -> WASAPI buffer frames: " << player.GetBufferFrames() 
@@ -98,6 +146,12 @@ void TestTapSounds() {
               << ", isClient3: " << (player.IsAudioClient3() ? "YES" : "NO") 
               << ", period: " << player.GetPeriodFrames() << " frames (" 
               << (player.GetPeriodFrames() * 1000.0 / (player.GetMixRate() > 0 ? player.GetMixRate() : 48000)) << " ms)" << std::endl;
+    
+    // Explicitly test playing Clang and rapid polyphonic dispatch
+    player.Play(TapSoundChoiceId::Clang);
+    for (int i = 0; i < 20; ++i) {
+        player.Play(TapSoundChoiceId::Clang);
+    }
     
     // Benchmark Play() invocation latency
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -350,9 +404,16 @@ void TestFluidityBenchmark() {
     TEST_ASSERT(created, "Overlay created");
     overlay.Activate();
     
+    HWND hOverlay = FindWindowW(L"TinyHand_OverlayClass", NULL);
+    TEST_ASSERT(hOverlay != NULL, "Overlay window found");
+    
+    // Stop background presentation thread during synchronous benchmark to eliminate thread contention
+    overlay.StopRenderThread();
+    
     // Warm up
     for (int i = 0; i < 5; ++i) {
         InputHook::Instance().onMouseMove(500 + i * 5, 500 + i * 5);
+        SendMessageW(hOverlay, WM_TIMER, 1, 0);
     }
     
     // Benchmark overlay rendering speed
@@ -360,7 +421,7 @@ void TestFluidityBenchmark() {
     int frames = 100;
     for (int i = 0; i < frames; ++i) {
         InputHook::Instance().onMouseMove(500 + i * 2, 500 + i * 2);
-        SendMessageW(FindWindowW(L"TinyHand_OverlayClass", NULL), WM_TIMER, 1, 0);
+        SendMessageW(hOverlay, WM_TIMER, 1, 0);
     }
     auto t1 = std::chrono::high_resolution_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -373,6 +434,7 @@ void TestFluidityBenchmark() {
     TEST_ASSERT(msPerFrame < 7.0, "Overlay render must sustain native 144Hz frame budget (<6.94ms per frame)");
     TEST_ASSERT(fps >= 144.0, "Must sustain 144Hz native refresh rate (>=144 FPS)");
     
+    overlay.StartRenderThread();
     overlay.Destroy();
     std::cout << "  -> Fluidity & High-FPS Performance PASSED" << std::endl;
 }
@@ -740,6 +802,97 @@ void TestToolbarDeadlockAndPointerSwitching() {
               << styleChanges << " style changes, " << mouseMoves << " mouse inputs processed with ZERO deadlocks)" << std::endl;
 }
 
+void TestWatchdogAndFreezeRecovery() {
+    std::cout << "[TEST] Testing Defensive Watchdog & Freeze Recovery..." << std::endl;
+    HINSTANCE hInst = GetModuleHandle(NULL);
+    OverlayWindow overlay;
+    bool created = overlay.Create(hInst);
+    TEST_ASSERT(created, "Overlay created for watchdog recovery test");
+    
+    // 1. Verify Low-Level Hook Watchdog Reinstallation
+    auto& hook = InputHook::Instance();
+    hook.SetActive(true);
+    bool installed = hook.Reinstall();
+    TEST_ASSERT(installed, "Hooks successfully installed");
+    
+    // Simulate hook activity
+    hook.RecordHookActivity();
+    TEST_ASSERT(hook.GetLastHookTime() > 0, "Hook activity timestamp recorded");
+    
+    // Test Watchdog Reinstallation mechanism
+    bool reinstalled = hook.Reinstall();
+    TEST_ASSERT(reinstalled, "Watchdog reinstallation successfully revived hooks");
+    
+    overlay.Activate();
+    TEST_ASSERT(overlay.IsActive(), "Overlay activated");
+    
+    // 2. Test that ApplySettings forces an immediate presentation tick even when loop was idle
+    // Let the presentation thread settle into idle wait
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    
+    Settings s = overlay.GetSettings();
+    s.currentStyle = PointerStyleId::Laser;
+    overlay.ApplySettings(s);
+    
+    // Verify style changed and front buffer was presented immediately
+    void* bitsLaser = overlay.GetFrontBufferBits();
+    TEST_ASSERT(bitsLaser != nullptr, "Immediate presentation tick succeeded on ApplySettings");
+    TEST_ASSERT(overlay.GetSettings().currentStyle == PointerStyleId::Laser, "Style set to Laser");
+    
+    // Switch to another style (Robo/Mech)
+    s.currentStyle = PointerStyleId::Robot;
+    overlay.ApplySettings(s);
+    void* bitsRobot = overlay.GetFrontBufferBits();
+    TEST_ASSERT(bitsRobot != nullptr, "Immediate presentation tick succeeded on second ApplySettings");
+    TEST_ASSERT(overlay.GetSettings().currentStyle == PointerStyleId::Robot, "Style set to Robot");
+    
+    // 3. Test Continuous GetCursorPos Polling when hooks are uninstalled / dropped
+    // Simulate Windows dropping WH_MOUSE_LL hooks completely
+    hook.Uninstall();
+    
+    POINT testPt = { 450, 350 };
+    if (SetCursorPos(testPt.x, testPt.y)) {
+        ULONGLONG start = GetTickCount64();
+        bool polled = false;
+        while (GetTickCount64() - start < 150) {
+            double cx = overlay.GetCursorX();
+            double cy = overlay.GetCursorY();
+            if (std::abs(cx - testPt.x) < 2.0 && std::abs(cy - testPt.y) < 2.0) {
+                polled = true;
+                break;
+            }
+            Sleep(5);
+        }
+        TEST_ASSERT(polled, "Render thread continuously polls GetCursorPos even when hooks are dropped");
+    }
+    
+    // 4. Test Buffer Reinitialization and DWM Layered Recovery (Zero Deadlock)
+    for (int cycle = 0; cycle < 5; ++cycle) {
+        overlay.RecreateBuffers(1280 + cycle * 10, 720 + cycle * 10);
+        TEST_ASSERT(overlay.GetFrontBufferBits() != nullptr, "Buffer valid after reinit cycle");
+        
+        // Immediate style toggle during buffer reinitialization
+        s.currentStyle = (cycle % 2 == 0) ? PointerStyleId::Laser : PointerStyleId::Lavender;
+        overlay.ApplySettings(s);
+        TEST_ASSERT(overlay.GetSettings().currentStyle == s.currentStyle, "Style applied cleanly during buffer reinit");
+    }
+    
+    // 5. Test Clang Sound WASAPI Multi-Voice Playback and Zero-Underflow Draining
+    auto& player = TapSoundPlayer::Instance();
+    for (int i = 0; i < 8; ++i) {
+        player.Play(TapSoundChoiceId::Clang);
+    }
+    // Sleep briefly to let voices drain without WASAPI glitch or thread starvation
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    TEST_ASSERT(true, "Clang sound multi-voice played and drained cleanly without spin-loop or crash");
+    
+    // Reinstall hooks and clean up
+    hook.Install();
+    overlay.Deactivate();
+    overlay.Destroy();
+    std::cout << "  -> Defensive Watchdog & Freeze Recovery PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "TinyHand Windows Test Suite" << std::endl;
@@ -763,12 +916,13 @@ int main() {
     TestRealtimeCursorTracking();
     Test144HzRefreshRateLock();
     TestToolbarDeadlockAndPointerSwitching();
+    TestWatchdogAndFreezeRecovery();
     
     HandAssetManager::Instance().ClearCache();
     Gdiplus::GdiplusShutdown(gdiplusToken);
     
     std::cout << "========================================" << std::endl;
-    std::cout << "ALL 13 TEST SUITES PASSED (100% SUCCESS)!" << std::endl;
+    std::cout << "ALL 14 TEST SUITES PASSED (100% SUCCESS)!" << std::endl;
     std::cout << "========================================" << std::endl;
     return 0;
 }

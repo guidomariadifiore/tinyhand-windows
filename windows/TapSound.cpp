@@ -188,7 +188,7 @@ void TapSoundPlayer::ShutdownWasapi() {
 
 void TapSoundPlayer::AudioThreadProc() {
     timeBeginPeriod(1);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     
     IAudioClient* pAudioClient = (IAudioClient*)m_pAudioClient;
     IAudioRenderClient* pRenderClient = (IAudioRenderClient*)m_pRenderClient;
@@ -208,15 +208,12 @@ void TapSoundPlayer::AudioThreadProc() {
             hasVoices = !m_voices.empty();
         }
         
-        if (!hasVoices) {
-            // Drain queue so padding stays at 0 when idle.
-            // Next tap starts instantly at offset 0 (<5ms latency) without queued silence delay.
-            continue;
-        }
-        
         UINT32 padding = 0;
         HRESULT hr = pAudioClient->GetCurrentPadding(&padding);
-        if (FAILED(hr)) continue;
+        if (FAILED(hr)) {
+            Sleep(10);
+            continue;
+        }
         
         UINT32 framesNeeded = m_bufferFrames - padding;
         if (framesNeeded == 0) continue;
@@ -224,6 +221,13 @@ void TapSoundPlayer::AudioThreadProc() {
         BYTE* pData = NULL;
         hr = pRenderClient->GetBuffer(framesNeeded, &pData);
         if (FAILED(hr) || !pData) continue;
+        
+        if (!hasVoices) {
+            // Feed silence with AUDCLNT_BUFFERFLAGS_SILENT to avoid WASAPI underflow/glitch
+            // and eliminate CPU spin loops.
+            pRenderClient->ReleaseBuffer(framesNeeded, AUDCLNT_BUFFERFLAGS_SILENT);
+            continue;
+        }
         
         mixBuffer.assign(framesNeeded * 2, 0.0f);
         
@@ -426,9 +430,10 @@ void TapSoundPlayer::Play(TapSoundChoiceId choice) {
     if (m_wasapiAvailable) {
         {
             std::lock_guard<std::mutex> lock(m_voiceMutex);
-            if (m_voices.size() < 16) {
-                m_voices.push_back({ choice, 0 });
+            if (m_voices.size() >= 16) {
+                m_voices.erase(m_voices.begin());
             }
+            m_voices.push_back({ choice, 0 });
         }
         if (m_hAudioEvent) {
             SetEvent(m_hAudioEvent);
